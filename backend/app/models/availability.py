@@ -4,7 +4,8 @@ from sqlalchemy import (
     String,
     Time,
     Boolean,
-    ForeignKey
+    ForeignKey,
+    Date
 )
 
 from sqlalchemy.orm import relationship
@@ -48,6 +49,7 @@ class DoctorAvailability(Base):
         default=True,
         nullable=False
     )
+    specific_date = Column(Date, nullable=True, index=True)
 
     doctor = relationship(
         "Doctor"

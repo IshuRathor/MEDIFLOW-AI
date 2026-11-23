@@ -1,9 +1,11 @@
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, Query
 from sqlalchemy.orm import Session
 
 from app.database.db import SessionLocal
+from app.core.security import require_roles
 from app.models.doctor import Doctor
 from app.schemas.doctor import DoctorCreate, DoctorResponse
+from sqlalchemy.exc import IntegrityError
 
 
 router = APIRouter(
@@ -22,7 +24,11 @@ def get_db():
 
 
 # CREATE DOCTOR
-@router.post("/", response_model=DoctorResponse)
+@router.post(
+    "/",
+    response_model=DoctorResponse,
+    dependencies=[Depends(require_roles("admin", "staff"))]
+)
 def create_doctor(
     doctor: DoctorCreate,
     db: Session = Depends(get_db)
@@ -47,8 +53,12 @@ def create_doctor(
     )
 
     db.add(new_doctor)
-    db.commit()
-    db.refresh(new_doctor)
+    try:
+        db.commit()
+        db.refresh(new_doctor)
+    except IntegrityError:
+        db.rollback()
+        raise HTTPException(status_code=409, detail="Doctor with this email already exists")
 
     return new_doctor
 
@@ -56,9 +66,23 @@ def create_doctor(
 # GET ALL DOCTORS
 @router.get("/", response_model=list[DoctorResponse])
 def get_doctors(
+    search: str | None = Query(default=None, max_length=120),
+    specialization: str | None = Query(default=None, max_length=120),
+    limit: int = Query(default=50, ge=1, le=200),
+    offset: int = Query(default=0, ge=0),
+    sort: str = Query(default="created_at"),
+    order: str = Query(default="desc", pattern="^(asc|desc)$"),
     db: Session = Depends(get_db)
 ):
-    return db.query(Doctor).all()
+    allowed_sort_fields = {"name": Doctor.name, "created_at": Doctor.created_at, "experience_years": Doctor.experience_years}
+    sort_column = allowed_sort_fields.get(sort, Doctor.created_at)
+    query = db.query(Doctor)
+    if search:
+        query = query.filter(Doctor.name.ilike(f"%{search}%") | Doctor.email.ilike(f"%{search}%"))
+    if specialization:
+        query = query.filter(Doctor.specialization.ilike(f"%{specialization}%"))
+    query = query.order_by(sort_column.asc() if order == "asc" else sort_column.desc())
+    return query.offset(offset).limit(limit).all()
 
 
 # GET DOCTOR BY ID
@@ -81,7 +105,11 @@ def get_doctor(
 
 
 # UPDATE DOCTOR
-@router.put("/{doctor_id}", response_model=DoctorResponse)
+@router.put(
+    "/{doctor_id}",
+    response_model=DoctorResponse,
+    dependencies=[Depends(require_roles("admin", "staff"))]
+)
 def update_doctor(
     doctor_id: int,
     doctor_data: DoctorCreate,
@@ -122,7 +150,10 @@ def update_doctor(
 
 
 # DELETE DOCTOR
-@router.delete("/{doctor_id}")
+@router.delete(
+    "/{doctor_id}",
+    dependencies=[Depends(require_roles("admin"))]
+)
 def delete_doctor(
     doctor_id: int,
     db: Session = Depends(get_db)

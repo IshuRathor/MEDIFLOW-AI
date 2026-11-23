@@ -1,4 +1,5 @@
 from sqlalchemy import (
+    CheckConstraint,
     Column,
     Integer,
     String,
@@ -19,6 +20,10 @@ from app.database.db import Base
 
 class Bill(Base):
     __tablename__ = "bills"
+
+    __table_args__ = (
+        CheckConstraint("total_amount >= 0", name="ck_bill_total_non_negative"),
+    )
 
     id = Column(Integer, primary_key=True, index=True)
 
@@ -78,6 +83,12 @@ class Bill(Base):
 class BillItem(Base):
     __tablename__ = "bill_items"
 
+    __table_args__ = (
+        CheckConstraint("quantity > 0", name="ck_bill_item_quantity_positive"),
+        CheckConstraint("unit_price >= 0", name="ck_bill_item_price_non_negative"),
+        CheckConstraint("amount >= 0", name="ck_bill_item_amount_non_negative"),
+    )
+
     id = Column(Integer, primary_key=True, index=True)
 
     bill_id = Column(
@@ -121,6 +132,10 @@ class BillItem(Base):
 
 class Payment(Base):
     __tablename__ = "payments"
+
+    __table_args__ = (
+        CheckConstraint("amount > 0", name="ck_payment_amount_positive"),
+    )
 
     id = Column(Integer, primary_key=True, index=True)
 
@@ -171,6 +186,10 @@ class Payment(Base):
 
 class Expense(Base):
     __tablename__ = "expenses"
+
+    __table_args__ = (
+        CheckConstraint("amount >= 0", name="ck_expense_amount_non_negative"),
+    )
 
     id = Column(Integer, primary_key=True, index=True)
 

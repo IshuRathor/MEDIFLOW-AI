@@ -38,6 +38,15 @@ build/
 .DS_Store
 Thumbs.db
 
+# Temporary and coverage output
+.cache/
+.coverage
+coverage/
+htmlcov/
+*.tmp
+*.bak
+*.swp
+
 # Local database files
 *.db
 *.sqlite

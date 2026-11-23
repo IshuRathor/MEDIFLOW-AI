@@ -1,4 +1,4 @@
-from sqlalchemy import Column, Integer, String, DateTime, ForeignKey
+from sqlalchemy import Column, DateTime, ForeignKey, Index, Integer, String, text
 from sqlalchemy.orm import relationship
 from sqlalchemy.sql import func
 
@@ -7,6 +7,25 @@ from app.database.db import Base
 
 class Appointment(Base):
     __tablename__ = "appointments"
+
+    __table_args__ = (
+        Index(
+            "uq_scheduled_doctor_slot",
+            "doctor_id",
+            "appointment_date",
+            unique=True,
+            sqlite_where=text("status = 'Scheduled'"),
+            postgresql_where=text("status = 'Scheduled'")
+        ),
+        Index(
+            "uq_scheduled_patient_slot",
+            "patient_id",
+            "appointment_date",
+            unique=True,
+            sqlite_where=text("status = 'Scheduled'"),
+            postgresql_where=text("status = 'Scheduled'")
+        )
+    )
 
     id = Column(Integer, primary_key=True, index=True)
 

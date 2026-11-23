@@ -14,8 +14,13 @@ load_dotenv()
 
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 
-client = genai.Client(
-    api_key=GEMINI_API_KEY
+client = (
+    genai.Client(
+        api_key=GEMINI_API_KEY,
+        http_options=genai.types.HttpOptions(timeout=10000),
+    )
+    if GEMINI_API_KEY
+    else None
 )
 
 
@@ -275,6 +280,23 @@ def route_triage_to_hospital(triage_result):
 
 
 def main_agent(user_query: str):
+    if client is None:
+        lowered = user_query.lower()
+        if any(word in lowered for word in (
+            "severe chest pain",
+            "difficulty breathing",
+            "unconscious",
+            "severe bleeding",
+            "stroke",
+            "seizure",
+            "symptom",
+        )) or "triage" in lowered:
+            return route_triage_to_hospital(triage_patient(user_query))
+        if any(word in lowered for word in ("revenue", "expense", "income", "bill", "payment", "financial")):
+            return finance_agent(user_query)
+        if any(word in lowered for word in ("doctor", "patient", "appointment", "availability", "admission")):
+            return hospital_agent(user_query)
+        return support_agent(user_query)
 
     prompt = f"""
 You are the Main AI Agent of MEDIFLOW AI,
@@ -348,60 +370,22 @@ SUPPORT
 TRIAGE
 """
 
-    try:
+    response = client.models.generate_content(
+        model="gemini-2.5-flash",
+        contents=prompt
+    )
+    selected_agent = response.text.strip().upper()
 
-        response = client.models.generate_content(
-            model="gemini-2.5-flash",
-            contents=prompt
-        )
+    if selected_agent == "HOSPITAL":
+        return hospital_agent(user_query)
 
-        selected_agent = response.text.strip().upper()
+    if selected_agent == "FINANCE":
+        return finance_agent(user_query)
 
-        if selected_agent == "HOSPITAL":
+    if selected_agent == "SUPPORT":
+        return support_agent(user_query)
 
-            return hospital_agent(
-                user_query
-            )
+    if selected_agent == "TRIAGE":
+        return route_triage_to_hospital(triage_patient(user_query))
 
-        elif selected_agent == "FINANCE":
-
-            return finance_agent(
-                user_query
-            )
-
-        elif selected_agent == "SUPPORT":
-
-            return support_agent(
-                user_query
-            )
-
-        elif selected_agent == "TRIAGE":
-
-            triage_result = triage_patient(
-                user_query
-            )
-
-            return route_triage_to_hospital(
-                triage_result
-            )
-
-        else:
-
-            return {
-                "agent": "Main AI Agent",
-                "message": (
-                    "I could not determine the "
-                    "appropriate agent."
-                )
-            }
-
-    except Exception as e:
-
-        return {
-            "agent": "Main AI Agent",
-            "message": (
-                "An error occurred while processing "
-                "the AI request."
-            ),
-            "error": str(e)
-        }
+    raise RuntimeError("The AI router returned an unsupported agent selection.")

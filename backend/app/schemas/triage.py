@@ -28,3 +28,7 @@ class TriageResponse(BaseModel):
         "This is an AI-assisted triage recommendation "
         "and not a medical diagnosis."
     )
+    safety_notice: str = (
+        "If symptoms are severe, rapidly worsening, or life-threatening, "
+        "call local emergency services or seek immediate medical care."
+    )

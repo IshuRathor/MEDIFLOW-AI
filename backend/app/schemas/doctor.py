@@ -10,6 +10,7 @@ class DoctorCreate(BaseModel):
     email: EmailStr
     department: Optional[str] = None
     experience_years: int = 0
+    appointment_duration_minutes: int = 30
 
 
 class DoctorResponse(DoctorCreate):

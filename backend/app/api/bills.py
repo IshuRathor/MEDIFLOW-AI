@@ -1,9 +1,15 @@
-from fastapi import APIRouter, Depends, HTTPException
+from typing import Literal
+
+from fastapi import APIRouter, Depends, HTTPException, Query
 from sqlalchemy.orm import Session
 
 from app.database.db import SessionLocal
+from app.core.security import require_roles
 from app.models.finance import Bill
 from app.models.patient import Patient
+from app.schemas.finance import BillActionResponse, BillResponse, DeletionResponse
+from app.core.security import get_current_user
+from app.models.user import User
 
 
 router = APIRouter(
@@ -25,12 +31,16 @@ def get_db():
 # CREATE BILL
 # ============================================================
 
-@router.post("/")
+@router.post(
+    "/",
+    response_model=BillActionResponse,
+    dependencies=[Depends(require_roles("admin", "staff"))]
+)
 def create_bill(
     patient_id: int,
     bill_number: str,
-    total_amount: float,
-    status: str = "Pending",
+    total_amount: float = Query(..., gt=0),
+    status: Literal["Pending", "Partially Paid", "Paid", "Cancelled"] = "Pending",
     db: Session = Depends(get_db)
 ):
     # Check patient exists
@@ -83,11 +93,28 @@ def create_bill(
 # GET ALL BILLS
 # ============================================================
 
-@router.get("/")
+@router.get("/", response_model=list[BillResponse])
 def get_bills(
-    db: Session = Depends(get_db)
+    search: str | None = Query(default=None, max_length=120),
+    status: str | None = Query(default=None, max_length=40),
+    limit: int = Query(default=50, ge=1, le=200),
+    offset: int = Query(default=0, ge=0),
+    order: str = Query(default="desc", pattern="^(asc|desc)$"),
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
 ):
-    bills = db.query(Bill).all()
+    query = db.query(Bill)
+    if current_user.role == "patient":
+        owned_patient = db.query(Patient).filter(Patient.user_id == current_user.id).first()
+        if not owned_patient:
+            return []
+        query = query.filter(Bill.patient_id == owned_patient.id)
+    if search:
+        query = query.filter(Bill.bill_number.ilike(f"%{search}%"))
+    if status:
+        query = query.filter(Bill.status == status)
+    query = query.order_by(Bill.created_at.asc() if order == "asc" else Bill.created_at.desc())
+    bills = query.offset(offset).limit(limit).all()
 
     return [
         {
@@ -106,10 +133,11 @@ def get_bills(
 # GET BILL BY ID
 # ============================================================
 
-@router.get("/{bill_id}")
+@router.get("/{bill_id}", response_model=BillResponse)
 def get_bill(
     bill_id: int,
-    db: Session = Depends(get_db)
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
 ):
     bill = db.query(Bill).filter(
         Bill.id == bill_id
@@ -120,6 +148,10 @@ def get_bill(
             status_code=404,
             detail="Bill not found"
         )
+    if current_user.role == "patient":
+        owned_patient = db.query(Patient).filter(Patient.user_id == current_user.id).first()
+        if not owned_patient or bill.patient_id != owned_patient.id:
+            raise HTTPException(status_code=403, detail="You can only access your own bills")
 
     return {
         "id": bill.id,
@@ -135,11 +167,15 @@ def get_bill(
 # UPDATE BILL
 # ============================================================
 
-@router.put("/{bill_id}")
+@router.put(
+    "/{bill_id}",
+    response_model=BillActionResponse,
+    dependencies=[Depends(require_roles("admin", "staff"))]
+)
 def update_bill(
     bill_id: int,
-    total_amount: float,
-    status: str,
+    total_amount: float = Query(..., gt=0),
+    status: Literal["Pending", "Partially Paid", "Paid", "Cancelled"] = Query(...),
     db: Session = Depends(get_db)
 ):
     bill = db.query(Bill).filter(
@@ -175,7 +211,11 @@ def update_bill(
 # DELETE BILL
 # ============================================================
 
-@router.delete("/{bill_id}")
+@router.delete(
+    "/{bill_id}",
+    response_model=DeletionResponse,
+    dependencies=[Depends(require_roles("admin"))]
+)
 def delete_bill(
     bill_id: int,
     db: Session = Depends(get_db)

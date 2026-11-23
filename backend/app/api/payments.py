@@ -1,8 +1,20 @@
-from fastapi import APIRouter, Depends, HTTPException
+from typing import Literal
+from decimal import Decimal
+
+from fastapi import APIRouter, Depends, HTTPException, Query
 from sqlalchemy.orm import Session
 
 from app.database.db import SessionLocal
+from app.core.security import require_roles
 from app.models.finance import Payment, Bill
+from app.schemas.finance import (
+    DeletionResponse,
+    PaymentActionResponse,
+    PaymentResponse
+)
+from app.core.security import get_current_user
+from app.models.patient import Patient
+from app.models.user import User
 
 
 router = APIRouter(
@@ -24,12 +36,16 @@ def get_db():
 # CREATE PAYMENT
 # ============================================================
 
-@router.post("/")
+@router.post(
+    "/",
+    response_model=PaymentActionResponse,
+    dependencies=[Depends(require_roles("admin", "staff"))]
+)
 def create_payment(
     bill_id: int,
-    amount: float,
-    payment_method: str,
-    payment_status: str = "Completed",
+    amount: float = Query(..., gt=0),
+    payment_method: Literal["Cash", "Card", "Bank Transfer", "Insurance", "Other"] = Query(...),
+    payment_status: Literal["Pending", "Completed", "Failed", "Refunded"] = "Completed",
     transaction_reference: str | None = None,
     db: Session = Depends(get_db)
 ):
@@ -42,6 +58,22 @@ def create_payment(
         raise HTTPException(
             status_code=404,
             detail="Bill not found"
+        )
+
+    if bill.status == "Cancelled":
+        raise HTTPException(
+            status_code=409,
+            detail="Payments cannot be recorded against a cancelled bill"
+        )
+
+    completed_total = sum(
+        (payment.amount for payment in bill.payments if payment.payment_status == "Completed"),
+        Decimal("0")
+    )
+    if payment_status == "Completed" and Decimal(str(amount)) > bill.total_amount - completed_total:
+        raise HTTPException(
+            status_code=409,
+            detail="Payment exceeds the bill's outstanding balance"
         )
 
     # Check duplicate transaction reference
@@ -114,11 +146,21 @@ def create_payment(
 # GET ALL PAYMENTS
 # ============================================================
 
-@router.get("/")
+@router.get("/", response_model=list[PaymentResponse])
 def get_payments(
-    db: Session = Depends(get_db)
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
 ):
     payments = db.query(Payment).all()
+    if current_user.role == "patient":
+        owned_patient = db.query(Patient).filter(Patient.user_id == current_user.id).first()
+        if not owned_patient:
+            return []
+        owned_bill_ids = [
+            bill.id
+            for bill in db.query(Bill).filter(Bill.patient_id == owned_patient.id).all()
+        ]
+        payments = [payment for payment in payments if payment.bill_id in owned_bill_ids]
 
     return [
         {
@@ -138,10 +180,11 @@ def get_payments(
 # GET PAYMENT BY ID
 # ============================================================
 
-@router.get("/{payment_id}")
+@router.get("/{payment_id}", response_model=PaymentResponse)
 def get_payment(
     payment_id: int,
-    db: Session = Depends(get_db)
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
 ):
     payment = db.query(Payment).filter(
         Payment.id == payment_id
@@ -152,6 +195,11 @@ def get_payment(
             status_code=404,
             detail="Payment not found"
         )
+    if current_user.role == "patient":
+        owned_patient = db.query(Patient).filter(Patient.user_id == current_user.id).first()
+        bill = db.query(Bill).filter(Bill.id == payment.bill_id).first()
+        if not owned_patient or not bill or bill.patient_id != owned_patient.id:
+            raise HTTPException(status_code=403, detail="You can only access your own payments")
 
     return {
         "id": payment.id,
@@ -168,7 +216,11 @@ def get_payment(
 # DELETE PAYMENT
 # ============================================================
 
-@router.delete("/{payment_id}")
+@router.delete(
+    "/{payment_id}",
+    response_model=DeletionResponse,
+    dependencies=[Depends(require_roles("admin"))]
+)
 def delete_payment(
     payment_id: int,
     db: Session = Depends(get_db)

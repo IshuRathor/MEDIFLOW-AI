@@ -11,8 +11,14 @@ class PatientCreate(BaseModel):
     email: EmailStr
 
 
-class PatientResponse(PatientCreate):
+class PatientResponse(BaseModel):
     id: int
+    name: str
+    age: Optional[int] = None
+    gender: Optional[str] = None
+    phone: Optional[str] = None
+    email: EmailStr
+    user_id: int | None = None
     created_at: datetime
 
     class Config:

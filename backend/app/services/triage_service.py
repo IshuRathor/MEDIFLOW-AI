@@ -28,6 +28,7 @@ def triage_patient(symptoms: str) -> TriageResponse:
         "stroke",
         "seizure",
         "convulsion"
+
     ]
 
     if any(keyword in query for keyword in emergency_keywords):
@@ -44,8 +45,8 @@ def triage_patient(symptoms: str) -> TriageResponse:
             recommended_department=department,
             symptoms_summary=symptoms,
             recommended_action=(
-                "Seek immediate medical evaluation "
-                "or emergency care."
+                "Call local emergency services now or go to the nearest "
+                "emergency department. Do not wait for an appointment."
             )
         )
 

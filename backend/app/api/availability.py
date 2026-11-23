@@ -1,248 +1,208 @@
-from fastapi import APIRouter, Depends, HTTPException
-from sqlalchemy.orm import Session
-from datetime import time
+from datetime import date, datetime, time, timedelta
 
-from app.database.db import SessionLocal
+from fastapi import APIRouter, Depends, HTTPException, Query
+from sqlalchemy.orm import Session
+
+from app.core.security import get_current_user, get_db, get_linked_doctor
+from app.models.appointment import Appointment
 from app.models.availability import DoctorAvailability
 from app.models.doctor import Doctor
+from app.models.user import User
 
 
-router = APIRouter(
-    prefix="/availability",
-    tags=["Doctor Availability"]
-)
+router = APIRouter(prefix="/availability", tags=["Doctor Availability"])
+VALID_DAYS = {"Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday"}
 
 
-def get_db():
-    db = SessionLocal()
-
+def _time(value: str) -> time:
     try:
-        yield db
-    finally:
-        db.close()
+        return time.fromisoformat(value)
+    except ValueError as error:
+        raise HTTPException(status_code=400, detail="Invalid time format. Use HH:MM") from error
 
 
-# ============================================================
-# VALID DAYS
-# ============================================================
-
-VALID_DAYS = {
-    "Monday",
-    "Tuesday",
-    "Wednesday",
-    "Thursday",
-    "Friday",
-    "Saturday",
-    "Sunday"
-}
-
-
-# ============================================================
-# CREATE DOCTOR AVAILABILITY
-# ============================================================
-
-@router.post("/")
-def create_availability(
-    doctor_id: int,
-    day_of_week: str,
-    start_time: str,
-    end_time: str,
-    is_available: bool = True,
-    db: Session = Depends(get_db)
-):
-    # --------------------------------------------------------
-    # Check doctor
-    # --------------------------------------------------------
-
-    doctor = db.query(Doctor).filter(
-        Doctor.id == doctor_id
-    ).first()
-
-    if not doctor:
-        raise HTTPException(
-            status_code=404,
-            detail="Doctor not found"
-        )
-
-    # --------------------------------------------------------
-    # Validate day
-    # --------------------------------------------------------
-
-    day_of_week = day_of_week.capitalize()
-
-    if day_of_week not in VALID_DAYS:
-        raise HTTPException(
-            status_code=400,
-            detail=(
-                "Invalid day. Use Monday, Tuesday, Wednesday, "
-                "Thursday, Friday, Saturday or Sunday."
-            )
-        )
-
-    # --------------------------------------------------------
-    # Validate time
-    # --------------------------------------------------------
-
-    try:
-        start = time.fromisoformat(start_time)
-        end = time.fromisoformat(end_time)
-
-    except ValueError:
-        raise HTTPException(
-            status_code=400,
-            detail="Invalid time format. Use HH:MM:SS"
-        )
-
-    if start >= end:
-        raise HTTPException(
-            status_code=400,
-            detail="Start time must be earlier than end time."
-        )
-
-    # --------------------------------------------------------
-    # Check duplicate schedule
-    # --------------------------------------------------------
-
-    existing = db.query(DoctorAvailability).filter(
-        DoctorAvailability.doctor_id == doctor_id,
-        DoctorAvailability.day_of_week == day_of_week
-    ).first()
-
-    if existing:
-        raise HTTPException(
-            status_code=409,
-            detail=(
-                "Availability already exists for this doctor "
-                "on this day."
-            )
-        )
-
-    # --------------------------------------------------------
-    # Create availability
-    # --------------------------------------------------------
-
-    availability = DoctorAvailability(
-        doctor_id=doctor_id,
-        day_of_week=day_of_week,
-        start_time=start,
-        end_time=end,
-        is_available=is_available
-    )
-
-    db.add(availability)
-    db.commit()
-    db.refresh(availability)
-
+def _serialize(item: DoctorAvailability):
     return {
-        "message": "Doctor availability created successfully",
-        "availability": {
-            "id": availability.id,
-            "doctor_id": availability.doctor_id,
-            "day_of_week": availability.day_of_week,
-            "start_time": availability.start_time,
-            "end_time": availability.end_time,
-            "is_available": availability.is_available
-        }
+        "id": item.id,
+        "doctor_id": item.doctor_id,
+        "day_of_week": item.day_of_week,
+        "specific_date": item.specific_date.isoformat() if item.specific_date else None,
+        "start_time": item.start_time.isoformat(),
+        "end_time": item.end_time.isoformat(),
+        "is_available": item.is_available,
     }
 
 
-# ============================================================
-# GET ALL AVAILABILITIES
-# ============================================================
+def _datetime_naive(value: datetime) -> datetime:
+    if value.tzinfo is not None:
+        return value.replace(tzinfo=None)
+    return value
 
-@router.get("/")
-def get_all_availability(
-    db: Session = Depends(get_db)
-):
-    availability = db.query(
-        DoctorAvailability
+
+def _rules_for_date(db: Session, doctor_id: int, target_date: date):
+    exceptions = db.query(DoctorAvailability).filter(
+        DoctorAvailability.doctor_id == doctor_id,
+        DoctorAvailability.specific_date == target_date,
+    ).all()
+    if exceptions:
+        blocked = [item for item in exceptions if not item.is_available]
+        if blocked:
+            return [], True
+        return [item for item in exceptions if item.is_available], False
+
+    weekday = target_date.strftime("%A")
+    recurring = db.query(DoctorAvailability).filter(
+        DoctorAvailability.doctor_id == doctor_id,
+        DoctorAvailability.specific_date.is_(None),
+        DoctorAvailability.day_of_week == weekday,
+        DoctorAvailability.is_available == True,
+    ).all()
+    return recurring, False
+
+
+def generate_slots(db: Session, doctor_id: int, target_date: date):
+    doctor = db.query(Doctor).filter(Doctor.id == doctor_id).first()
+    if not doctor:
+        raise HTTPException(status_code=404, detail="Doctor not found")
+
+    rules, blocked = _rules_for_date(db, doctor_id, target_date)
+    if blocked:
+        return {"blocked": True, "slots": [], "alternatives": _next_available_dates(db, doctor_id, target_date)}
+
+    duration = max(doctor.appointment_duration_minutes or 30, 5)
+    appointments = db.query(Appointment).filter(
+        Appointment.doctor_id == doctor_id,
+        Appointment.status == "Scheduled",
     ).all()
 
-    return [
-        {
-            "id": item.id,
-            "doctor_id": item.doctor_id,
-            "day_of_week": item.day_of_week,
-            "start_time": item.start_time,
-            "end_time": item.end_time,
-            "is_available": item.is_available
-        }
-        for item in availability
-    ]
+    slots = []
+    for rule in rules:
+        cursor = datetime.combine(target_date, rule.start_time)
+        range_end = datetime.combine(target_date, rule.end_time)
+        while cursor + timedelta(minutes=duration) <= range_end:
+            slot_end = cursor + timedelta(minutes=duration)
+            overlap = False
+            for appointment in appointments:
+                appointment_start = _datetime_naive(appointment.appointment_date)
+                appointment_end = appointment_start + timedelta(minutes=duration)
+                if cursor < appointment_end and slot_end > appointment_start:
+                    overlap = True
+                    break
+            slots.append({
+                "start": cursor.isoformat(),
+                "end": slot_end.isoformat(),
+                "status": "booked" if overlap else "available",
+            })
+            cursor = slot_end
+
+    if not slots:
+        return {"blocked": False, "slots": [], "alternatives": _next_available_dates(db, doctor_id, target_date)}
+    return {"blocked": False, "slots": slots, "alternatives": []}
 
 
-# ============================================================
-# GET AVAILABILITY BY DOCTOR
-# ============================================================
+def _next_available_dates(db: Session, doctor_id: int, target_date: date, limit: int = 7):
+    alternatives = []
+    for offset in range(1, 15):
+        candidate = target_date + timedelta(days=offset)
+        rules, blocked = _rules_for_date(db, doctor_id, candidate)
+        if rules and not blocked:
+            alternatives.append(candidate.isoformat())
+            if len(alternatives) >= limit:
+                break
+    return alternatives
+
+
+@router.post("/")
+def create_availability(
+    day_of_week: str,
+    start_time: str,
+    end_time: str,
+    specific_date: date | None = None,
+    is_available: bool = True,
+    doctor_id: int | None = None,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    if current_user.role == "clinician":
+        doctor = get_linked_doctor(db, current_user)
+        resolved_doctor_id = doctor.id
+    elif current_user.role in ("admin", "staff"):
+        if doctor_id is None:
+            raise HTTPException(status_code=400, detail="doctor_id is required")
+        resolved_doctor_id = doctor_id
+    else:
+        raise HTTPException(status_code=403, detail="You cannot modify doctor availability")
+
+    day_name = day_of_week.capitalize()
+    if day_name not in VALID_DAYS:
+        raise HTTPException(status_code=400, detail="Invalid day of week")
+    if specific_date and specific_date.strftime("%A") != day_name:
+        raise HTTPException(status_code=400, detail="specific_date does not match day_of_week")
+
+    start = _time(start_time)
+    end = _time(end_time)
+    if start >= end:
+        raise HTTPException(status_code=400, detail="Start time must be earlier than end time")
+    if specific_date and specific_date < date.today():
+        raise HTTPException(status_code=400, detail="Past dates cannot be configured")
+
+    doctor = db.query(Doctor).filter(Doctor.id == resolved_doctor_id).first()
+    if not doctor:
+        raise HTTPException(status_code=404, detail="Doctor not found")
+
+    item = DoctorAvailability(
+        doctor_id=resolved_doctor_id,
+        day_of_week=day_name,
+        specific_date=specific_date,
+        start_time=start,
+        end_time=end,
+        is_available=is_available,
+    )
+    db.add(item)
+    db.commit()
+    db.refresh(item)
+    return {"message": "Doctor availability saved successfully", "availability": _serialize(item)}
+
+
+@router.get("/me")
+def get_my_availability(
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    doctor = get_linked_doctor(db, current_user)
+    items = db.query(DoctorAvailability).filter(DoctorAvailability.doctor_id == doctor.id).order_by(
+        DoctorAvailability.specific_date.asc().nulls_last(),
+        DoctorAvailability.day_of_week.asc(),
+        DoctorAvailability.start_time.asc(),
+    ).all()
+    return [_serialize(item) for item in items]
+
+
+@router.get("/slots/{doctor_id}")
+def get_available_slots(
+    doctor_id: int,
+    target_date: date = Query(..., alias="date"),
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    if target_date < date.today():
+        raise HTTPException(status_code=400, detail="Past dates cannot be booked")
+    return generate_slots(db, doctor_id, target_date)
+
 
 @router.get("/doctor/{doctor_id}")
 def get_doctor_availability(
     doctor_id: int,
-    db: Session = Depends(get_db)
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
 ):
-    doctor = db.query(Doctor).filter(
-        Doctor.id == doctor_id
-    ).first()
-
-    if not doctor:
-        raise HTTPException(
-            status_code=404,
-            detail="Doctor not found"
-        )
-
-    availability = db.query(
-        DoctorAvailability
-    ).filter(
-        DoctorAvailability.doctor_id == doctor_id
+    items = db.query(DoctorAvailability).filter(DoctorAvailability.doctor_id == doctor_id).order_by(
+        DoctorAvailability.specific_date.asc().nulls_last(),
+        DoctorAvailability.day_of_week.asc(),
+        DoctorAvailability.start_time.asc(),
     ).all()
+    return [_serialize(item) for item in items]
 
-    return [
-        {
-            "id": item.id,
-            "doctor_id": item.doctor_id,
-            "day_of_week": item.day_of_week,
-            "start_time": item.start_time,
-            "end_time": item.end_time,
-            "is_available": item.is_available
-        }
-        for item in availability
-    ]
-
-
-# ============================================================
-# GET AVAILABILITY BY ID
-# ============================================================
-
-@router.get("/{availability_id}")
-def get_availability(
-    availability_id: int,
-    db: Session = Depends(get_db)
-):
-    availability = db.query(
-        DoctorAvailability
-    ).filter(
-        DoctorAvailability.id == availability_id
-    ).first()
-
-    if not availability:
-        raise HTTPException(
-            status_code=404,
-            detail="Availability record not found"
-        )
-
-    return {
-        "id": availability.id,
-        "doctor_id": availability.doctor_id,
-        "day_of_week": availability.day_of_week,
-        "start_time": availability.start_time,
-        "end_time": availability.end_time,
-        "is_available": availability.is_available
-    }
-
-
-# ============================================================
-# UPDATE AVAILABILITY
-# ============================================================
 
 @router.put("/{availability_id}")
 def update_availability(
@@ -250,124 +210,54 @@ def update_availability(
     day_of_week: str,
     start_time: str,
     end_time: str,
+    specific_date: date | None = None,
     is_available: bool = True,
-    db: Session = Depends(get_db)
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
 ):
-    availability = db.query(
-        DoctorAvailability
-    ).filter(
-        DoctorAvailability.id == availability_id
-    ).first()
+    item = db.query(DoctorAvailability).filter(DoctorAvailability.id == availability_id).first()
+    if not item:
+        raise HTTPException(status_code=404, detail="Availability record not found")
+    if current_user.role == "clinician":
+        doctor = get_linked_doctor(db, current_user)
+        if item.doctor_id != doctor.id:
+            raise HTTPException(status_code=403, detail="You can only modify your own availability")
+    elif current_user.role not in ("admin", "staff"):
+        raise HTTPException(status_code=403, detail="You cannot modify doctor availability")
 
-    if not availability:
-        raise HTTPException(
-            status_code=404,
-            detail="Availability record not found"
-        )
+    day_name = day_of_week.capitalize()
+    start = _time(start_time)
+    end = _time(end_time)
+    if day_name not in VALID_DAYS or start >= end:
+        raise HTTPException(status_code=400, detail="Invalid availability range")
+    if specific_date and specific_date.strftime("%A") != day_name:
+        raise HTTPException(status_code=400, detail="specific_date does not match day_of_week")
 
-    # --------------------------------------------------------
-    # Validate day
-    # --------------------------------------------------------
-
-    day_of_week = day_of_week.capitalize()
-
-    if day_of_week not in VALID_DAYS:
-        raise HTTPException(
-            status_code=400,
-            detail="Invalid day of week."
-        )
-
-    # --------------------------------------------------------
-    # Validate time
-    # --------------------------------------------------------
-
-    try:
-        start = time.fromisoformat(start_time)
-        end = time.fromisoformat(end_time)
-
-    except ValueError:
-        raise HTTPException(
-            status_code=400,
-            detail="Invalid time format. Use HH:MM:SS"
-        )
-
-    if start >= end:
-        raise HTTPException(
-            status_code=400,
-            detail="Start time must be earlier than end time."
-        )
-
-    # --------------------------------------------------------
-    # Check duplicate day
-    # --------------------------------------------------------
-
-    existing = db.query(
-        DoctorAvailability
-    ).filter(
-        DoctorAvailability.doctor_id == availability.doctor_id,
-        DoctorAvailability.day_of_week == day_of_week,
-        DoctorAvailability.id != availability_id
-    ).first()
-
-    if existing:
-        raise HTTPException(
-            status_code=409,
-            detail=(
-                "Availability already exists for this doctor "
-                "on this day."
-            )
-        )
-
-    # --------------------------------------------------------
-    # Update
-    # --------------------------------------------------------
-
-    availability.day_of_week = day_of_week
-    availability.start_time = start
-    availability.end_time = end
-    availability.is_available = is_available
-
+    item.day_of_week = day_name
+    item.specific_date = specific_date
+    item.start_time = start
+    item.end_time = end
+    item.is_available = is_available
     db.commit()
-    db.refresh(availability)
+    db.refresh(item)
+    return {"message": "Doctor availability updated successfully", "availability": _serialize(item)}
 
-    return {
-        "message": "Doctor availability updated successfully",
-        "availability": {
-            "id": availability.id,
-            "doctor_id": availability.doctor_id,
-            "day_of_week": availability.day_of_week,
-            "start_time": availability.start_time,
-            "end_time": availability.end_time,
-            "is_available": availability.is_available
-        }
-    }
-
-
-# ============================================================
-# DELETE AVAILABILITY
-# ============================================================
 
 @router.delete("/{availability_id}")
 def delete_availability(
     availability_id: int,
-    db: Session = Depends(get_db)
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
 ):
-    availability = db.query(
-        DoctorAvailability
-    ).filter(
-        DoctorAvailability.id == availability_id
-    ).first()
-
-    if not availability:
-        raise HTTPException(
-            status_code=404,
-            detail="Availability record not found"
-        )
-
-    db.delete(availability)
+    item = db.query(DoctorAvailability).filter(DoctorAvailability.id == availability_id).first()
+    if not item:
+        raise HTTPException(status_code=404, detail="Availability record not found")
+    if current_user.role == "clinician":
+        doctor = get_linked_doctor(db, current_user)
+        if item.doctor_id != doctor.id:
+            raise HTTPException(status_code=403, detail="You can only delete your own availability")
+    elif current_user.role not in ("admin", "staff"):
+        raise HTTPException(status_code=403, detail="You cannot modify doctor availability")
+    db.delete(item)
     db.commit()
-
-    return {
-        "message": "Doctor availability deleted successfully",
-        "availability_id": availability_id
-    }
+    return {"message": "Doctor availability deleted successfully", "availability_id": availability_id}
