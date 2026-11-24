@@ -729,6 +729,48 @@ def _build_registry() -> ToolRegistry:
             "required": [],
         },
     )
+    registry.register(
+        "generate_bill",
+        "Propose a bill for explicit administrator or finance-staff approval.",
+        ("admin", "staff"),
+        lambda db, user, patient_id, bill_number, total_amount: {
+            "status": "clarification_required",
+            "patient_id": patient_id,
+            "bill_number": bill_number,
+            "total_amount": total_amount,
+        },
+        {
+            "type": "object",
+            "properties": {
+                "patient_id": {"type": "integer"},
+                "bill_number": {"type": "string"},
+                "total_amount": {"type": "number"},
+            },
+            "required": ["patient_id", "bill_number", "total_amount"],
+        },
+        kind="approval_write",
+    )
+    registry.register(
+        "record_payment",
+        "Propose a payment record for explicit administrator or finance-staff approval.",
+        ("admin", "staff"),
+        lambda db, user, bill_id, amount, payment_method: {
+            "status": "clarification_required",
+            "bill_id": bill_id,
+            "amount": amount,
+            "payment_method": payment_method,
+        },
+        {
+            "type": "object",
+            "properties": {
+                "bill_id": {"type": "integer"},
+                "amount": {"type": "number"},
+                "payment_method": {"type": "string"},
+            },
+            "required": ["bill_id", "amount", "payment_method"],
+        },
+        kind="approval_write",
+    )
     return registry
 
 
@@ -847,6 +889,66 @@ def _store_pending_action(db: Session, user, conversation_id: str, action: str, 
 
 
 def _determine_write_action(db: Session, user, conversation_id: str, name: str, arguments: dict) -> dict | None:
+    if name == "generate_bill":
+        required = ("patient_id", "bill_number", "total_amount")
+        if not all(key in arguments for key in required):
+            return None
+        if user.role not in ("admin", "staff"):
+            return {
+                "conversation_id": conversation_id,
+                "agent": "Finance Agent",
+                "status": "error",
+                "message": "You do not have permission to generate bills.",
+                "data": {},
+                "trace": [],
+                "approval_id": None,
+            }
+        patient = db.query(Patient).filter(Patient.id == int(arguments["patient_id"])).first()
+        if not patient:
+            return {
+                "conversation_id": conversation_id,
+                "agent": "Finance Agent",
+                "status": "error",
+                "message": "Patient was not found.",
+                "data": {},
+                "trace": [],
+                "approval_id": None,
+            }
+        return _store_pending_action(db, user, conversation_id, "generate_bill", {
+            "patient_id": int(arguments["patient_id"]),
+            "bill_number": str(arguments["bill_number"]),
+            "total_amount": float(arguments["total_amount"]),
+        })
+    if name == "record_payment":
+        required = ("bill_id", "amount", "payment_method")
+        if not all(key in arguments for key in required):
+            return None
+        if user.role not in ("admin", "staff"):
+            return {
+                "conversation_id": conversation_id,
+                "agent": "Finance Agent",
+                "status": "error",
+                "message": "You do not have permission to record payments.",
+                "data": {},
+                "trace": [],
+                "approval_id": None,
+            }
+        bill = db.query(Bill).filter(Bill.id == int(arguments["bill_id"])).first()
+        if not bill:
+            return {
+                "conversation_id": conversation_id,
+                "agent": "Finance Agent",
+                "status": "error",
+                "message": "Bill was not found.",
+                "data": {},
+                "trace": [],
+                "approval_id": None,
+            }
+        return _store_pending_action(db, user, conversation_id, "record_payment", {
+            "bill_id": int(arguments["bill_id"]),
+            "amount": float(arguments["amount"]),
+            "payment_method": str(arguments["payment_method"]),
+        })
     if name == "cancel_appointment":
         appointment_id = arguments.get("appointment_id")
         if not isinstance(appointment_id, int):

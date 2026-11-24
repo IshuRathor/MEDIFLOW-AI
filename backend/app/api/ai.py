@@ -15,6 +15,7 @@ from app.models.availability import DoctorAvailability
 from app.api.availability import generate_slots
 from app.models.doctor import Doctor
 from app.models.patient import Patient
+from app.models.finance import Bill, Payment
 from app.models.user import User
 from app.schemas.ai import AIChatResponse, ApprovalResponse, ChatRequest
 
@@ -302,6 +303,85 @@ def decide_approval(
                 "doctor_id": appointment.doctor_id,
                 "appointment_date": appointment.appointment_date.isoformat(),
                 "status": appointment.status,
+            }
+            db.commit()
+            result = approval.execution_result_json
+
+        elif approval.action == "generate_bill":
+            if current_user.role not in ("admin", "staff"):
+                raise HTTPException(status_code=403, detail="Only administrators or finance staff can generate bills")
+            parameters = approval.parameters_json
+            patient = db.query(Patient).filter(Patient.id == int(parameters["patient_id"])).first()
+            if not patient:
+                raise HTTPException(status_code=404, detail="Patient not found")
+            existing = db.query(Bill).filter(Bill.bill_number == str(parameters["bill_number"])).first()
+            if existing:
+                raise HTTPException(status_code=409, detail="Bill number already exists")
+            amount = float(parameters["total_amount"])
+            if amount <= 0:
+                raise HTTPException(status_code=400, detail="Bill amount must be greater than zero")
+            bill = Bill(
+                patient_id=patient.id,
+                bill_number=str(parameters["bill_number"]),
+                total_amount=amount,
+                status="Pending",
+            )
+            db.add(bill)
+            approval.status = "executed"
+            approval.executed_at = datetime.now(timezone.utc)
+            db.flush()
+            approval.execution_result_json = {
+                "message": "Bill generated successfully",
+                "bill_id": bill.id,
+                "bill_number": bill.bill_number,
+                "patient_id": bill.patient_id,
+                "total_amount": float(bill.total_amount),
+                "status": bill.status,
+            }
+            db.commit()
+            result = approval.execution_result_json
+
+        elif approval.action == "record_payment":
+            if current_user.role not in ("admin", "staff"):
+                raise HTTPException(status_code=403, detail="Only administrators or finance staff can record payments")
+            parameters = approval.parameters_json
+            bill = db.query(Bill).filter(Bill.id == int(parameters["bill_id"])).with_for_update().first()
+            if not bill:
+                raise HTTPException(status_code=404, detail="Bill not found")
+            if bill.status == "Cancelled":
+                raise HTTPException(status_code=409, detail="Payments cannot be recorded against a cancelled bill")
+            amount = float(parameters["amount"])
+            if amount <= 0:
+                raise HTTPException(status_code=400, detail="Payment amount must be greater than zero")
+            completed = (
+                db.query(Payment)
+                .filter(Payment.bill_id == bill.id, Payment.payment_status == "Completed")
+                .all()
+            )
+            completed_total = sum((float(payment.amount) for payment in completed), 0.0)
+            if amount > float(bill.total_amount) - completed_total:
+                raise HTTPException(status_code=409, detail="Payment exceeds the bill's outstanding balance")
+            payment_method = str(parameters["payment_method"])
+            if payment_method not in {"Cash", "Card", "Bank Transfer", "Insurance", "Other"}:
+                raise HTTPException(status_code=400, detail="Invalid payment method")
+            payment = Payment(
+                bill_id=bill.id,
+                amount=amount,
+                payment_method=payment_method,
+                payment_status="Completed",
+            )
+            db.add(payment)
+            db.flush()
+            paid_total = completed_total + amount
+            bill.status = "Paid" if paid_total >= float(bill.total_amount) else "Partially Paid"
+            approval.status = "executed"
+            approval.executed_at = datetime.now(timezone.utc)
+            approval.execution_result_json = {
+                "message": "Payment recorded successfully",
+                "payment_id": payment.id,
+                "bill_id": bill.id,
+                "amount": amount,
+                "bill_status": bill.status,
             }
             db.commit()
             result = approval.execution_result_json

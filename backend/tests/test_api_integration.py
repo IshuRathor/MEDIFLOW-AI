@@ -988,6 +988,47 @@ class ApiIntegrationTests(unittest.TestCase):
         self.assertEqual(tool_result["pending_amount"], 40)
         self.assertEqual(tool_result["bills"][0]["outstanding_amount"], 40)
 
+    def test_ai_finance_write_requires_approval_and_enforces_role(self):
+        patient = self.client.get("/api/patients/", headers=self.headers).json()
+        if not patient:
+            patient = self.client.post(
+                "/api/patients/",
+                headers=self.headers,
+                json={"name": "Finance AI Patient", "age": 30, "email": "finance.ai.patient@example.com"},
+            ).json()
+        else:
+            patient = patient[0]
+
+        class BillCall:
+            name = "generate_bill"
+            args = {
+                "patient_id": patient["id"],
+                "bill_number": "AI-FINANCE-001",
+                "total_amount": 250.0,
+            }
+
+        class BillResponse:
+            function_calls = [BillCall()]
+            text = "Bill proposed."
+
+        with patch("app.ai.orchestrator._gemini_response", return_value=BillResponse()):
+            proposed = self.client.post(
+                "/api/ai/chat",
+                headers=self.headers,
+                json={"query": "Generate a bill for this patient"},
+            )
+        self.assertEqual(proposed.status_code, 200)
+        self.assertEqual(proposed.json()["status"], "approval_required")
+        approval_id = proposed.json()["approval_id"]
+
+        approved = self.client.post(
+            f"/api/ai/approvals/{approval_id}/approve",
+            headers=self.headers,
+        )
+        self.assertEqual(approved.status_code, 200)
+        self.assertEqual(approved.json()["status"], "executed")
+        self.assertIn("bill_id", approved.json()["result"])
+
     def test_gemini_mocked_function_call_executes_registered_tool(self):
         class Call:
             name = "search_doctors"
@@ -1623,6 +1664,30 @@ class ApiIntegrationTests(unittest.TestCase):
         )
         self.assertEqual(login.status_code, 200)
         patient_headers = {"Authorization": f"Bearer {login.json()['access_token']}"}
+
+        own_search = self.client.get(
+            "/api/patients/",
+            headers=patient_headers,
+            params={"search": "Owned Patient", "sort": "name", "order": "asc", "limit": 1, "offset": 0},
+        )
+        self.assertEqual(own_search.status_code, 200)
+        self.assertEqual([item["id"] for item in own_search.json()], [patient1["id"]])
+
+        foreign_search = self.client.get(
+            "/api/patients/",
+            headers=patient_headers,
+            params={"search": "Other Patient", "sort": "name", "order": "asc", "limit": 1, "offset": 0},
+        )
+        self.assertEqual(foreign_search.status_code, 200)
+        self.assertEqual(foreign_search.json(), [])
+
+        foreign_email_search = self.client.get(
+            "/api/patients/",
+            headers=patient_headers,
+            params={"search": "other.patient@example.com", "limit": 10, "offset": 0},
+        )
+        self.assertEqual(foreign_email_search.status_code, 200)
+        self.assertEqual(foreign_email_search.json(), [])
 
         owned = self.client.get(
             f"/api/patients/{patient1['id']}",

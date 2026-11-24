@@ -27,37 +27,77 @@ The frontend communicates with FastAPI REST endpoints. The backend separates aut
 
 The AI system uses one main orchestrator and specialized Hospital, Finance, Support and Triage behaviors backed by a validated tool registry. Sensitive operations require explicit user approval, and tools enforce server-side authorization and ownership.
 
-## Phase 1: Run the backend
+## Required software
+
+- Windows 10/11
+- Python 3.12.x (required for the pinned Windows database driver)
+- Node.js 20.19 or newer in the 20.x line, or 22.12 or newer
+- npm 10 or newer
+- PostgreSQL only when using shared/hosted database mode
+- Git
+
+Check versions:
+
+```powershell
+python --version
+node --version
+npm --version
+git --version
+```
+
+## Fresh Windows setup
+
+Clone the repository and enter the project:
+
+```powershell
+git clone https://github.com/IshuRathor/MEDIFLOW-AI.git
+Set-Location MEDIFLOW-AI
+```
+
+Create a per-developer Python environment and install the backend dependencies:
 
 ```powershell
 Set-Location backend
-python -m venv .venv
+py -3.12 -m venv .venv
+Set-ExecutionPolicy -ExecutionPolicy RemoteSigned -Scope Process
 .\.venv\Scripts\Activate.ps1
+python -m pip install --upgrade pip
 python -m pip install -r requirements.txt
 Copy-Item .env.example .env
-alembic upgrade head
-uvicorn app.main:app --reload
 ```
 
-The API is available at `http://localhost:8000`. Interactive API documentation is available at `http://localhost:8000/docs`.
+Edit `backend/.env` for this computer. Generate a private development JWT secret with `python -c "import secrets; print(secrets.token_urlsafe(48))"` and replace the placeholder. Keep `.env` private; it is ignored by Git. Leave `DATABASE_URL=sqlite:///./hospital.db` for an isolated local database. The database file is created under `backend/` when migrations run.
 
-SQLite is used by default for local development. Set `DATABASE_URL` in `backend/.env` to use PostgreSQL.
+Initialize the database and start the API (from `backend/`):
 
-`GEMINI_API_KEY` is required only for the AI chat and AI routing features. Core CRUD and triage endpoints do not require it.
+```powershell
+python -m alembic upgrade head
+python -m uvicorn app.main:app --reload --host 127.0.0.1 --port 8000
+```
+
+In a second PowerShell terminal, install the exact frontend dependencies from the lockfile and start Vite:
+
+```powershell
+Set-Location MEDIFLOW-AI\frontend
+npm ci
+npm run dev -- --host 127.0.0.1
+```
+
+Open `http://127.0.0.1:5173/`. The API is at `http://127.0.0.1:8000`; interactive documentation is at `http://127.0.0.1:8000/docs`. The frontend defaults to `http://localhost:8000/api`; set `VITE_API_URL` before starting Vite only if your API uses a different URL.
+
+Use SQLite for each developer's local work. For a shared PostgreSQL environment, install/run PostgreSQL separately and configure each authorized developer's `DATABASE_URL` privately in their own `backend/.env` (for example, `postgresql+psycopg2://user:password@localhost:5432/hospital_management`). Do not share a local SQLite file or commit database files. Shared databases contain shared data, so coordinate before using one.
+
+`GEMINI_API_KEY` is optional; core CRUD and deterministic triage work without it. Without a key, AI chat uses deterministic fallback behavior. `REDIS_URL` is also optional; without Redis, rate limits are process-local.
 
 ## Authentication
 
-The first account is created through `POST /api/auth/register` and receives the `admin` role. Once that account exists, public registration is closed. Use `POST /api/auth/login` to obtain a bearer token, then send it as `Authorization: Bearer <token>` when calling operational, triage, or AI endpoints.
+When the users table is empty, the first account registered through `POST /api/auth/register` receives the administrator role. Afterward, patient registration remains public; clinician, staff, and administrator registrations require an administrator's approval. Use `POST /api/auth/login` to obtain a bearer token, then send it as `Authorization: Bearer <token>` when calling operational, triage, or AI endpoints.
 
 Set a strong `JWT_SECRET_KEY` before sharing the environment or deploying it.
 
 ## Delivery phases
 
-1. Backend foundation and reproducible local setup
-2. Secure identity, roles, API contracts, and database integrity (constraints complete; migrations next)
-3. Professional operations dashboard and patient workflows
-4. Production-grade AI orchestration and clinical safety controls
-5. Tests, migrations, observability, deployment, and hardening
+The repository includes local setup, role-based workflows, relational constraints and migrations, an operational dashboard, deterministic triage, optional Gemini orchestration, and automated tests. Production deployment, observability, and clinical validation require separate planning and are not implied by the local development setup.
 
 ## Controlled AI workflow
 
@@ -132,11 +172,11 @@ integration suite against a restored staging copy.
 
 ```powershell
 Set-Location frontend
-npm install
-npm run dev
+npm ci
+npm run dev -- --host 127.0.0.1
 ```
 
-The frontend runs at `http://localhost:5173/` by default.
+The frontend runs at `http://127.0.0.1:5173/` by default.
 
 ## Environment variables
 
@@ -155,9 +195,10 @@ Required for production:
 
 ```powershell
 Set-Location backend
-.\venv\Scripts\python.exe -m unittest discover -s tests -t .
-.\venv\Scripts\python.exe -m alembic current
-.\venv\Scripts\python.exe -m alembic heads
+.\.venv\Scripts\python.exe -m unittest discover -s tests -t .
+.\.venv\Scripts\python.exe -m compileall -q app tests
+.\.venv\Scripts\python.exe -m alembic current
+.\.venv\Scripts\python.exe -m alembic heads
 ```
 
 ```powershell

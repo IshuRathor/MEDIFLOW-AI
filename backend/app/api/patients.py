@@ -67,17 +67,17 @@ def get_patients(
 ):
     allowed_sort_fields = {"name": Patient.name, "created_at": Patient.created_at, "age": Patient.age}
     sort_column = allowed_sort_fields.get(sort, Patient.created_at)
+    query = db.query(Patient)
+    if current_user.role == "patient":
+        owned_patient = db.query(Patient).filter(Patient.user_id == current_user.id).first()
+        if not owned_patient:
+            query = query.filter(Patient.id == -1)
+        else:
+            query = query.filter(Patient.id == owned_patient.id)
     if search:
-        query = db.query(Patient).filter(
+        query = query.filter(
             Patient.name.ilike(f"%{search}%") | Patient.email.ilike(f"%{search}%")
         )
-    else:
-        query = db.query(Patient)
-        if current_user.role == "patient":
-            owned_patient = db.query(Patient).filter(Patient.user_id == current_user.id).first()
-            if not owned_patient:
-                return []
-            query = query.filter(Patient.id == owned_patient.id)
     query = query.order_by(sort_column.asc() if order == "asc" else sort_column.desc())
     return query.offset(offset).limit(limit).all()
 
