@@ -5,7 +5,9 @@ from pydantic import BaseModel
 
 
 AppointmentStatus = Literal[
+    "Pending Doctor Approval",
     "Scheduled",
+    "Declined",
     "Completed",
     "Cancelled",
     "No-show"
@@ -20,6 +22,7 @@ class AppointmentResponse(BaseModel):
     reason: str | None = None
     status: AppointmentStatus
     notes: str | None = None
+    decline_reason: str | None = None
     created_at: datetime
 
 

@@ -5,25 +5,28 @@ from sqlalchemy.sql import func
 from app.database.db import Base
 
 
+ACTIVE_APPOINTMENT_STATUSES = ("Pending Doctor Approval", "Scheduled")
+
+
 class Appointment(Base):
     __tablename__ = "appointments"
 
     __table_args__ = (
         Index(
-            "uq_scheduled_doctor_slot",
+            "uq_active_doctor_slot",
             "doctor_id",
             "appointment_date",
             unique=True,
-            sqlite_where=text("status = 'Scheduled'"),
-            postgresql_where=text("status = 'Scheduled'")
+            sqlite_where=text("status IN ('Pending Doctor Approval', 'Scheduled')"),
+            postgresql_where=text("status IN ('Pending Doctor Approval', 'Scheduled')")
         ),
         Index(
-            "uq_scheduled_patient_slot",
+            "uq_active_patient_slot",
             "patient_id",
             "appointment_date",
             unique=True,
-            sqlite_where=text("status = 'Scheduled'"),
-            postgresql_where=text("status = 'Scheduled'")
+            sqlite_where=text("status IN ('Pending Doctor Approval', 'Scheduled')"),
+            postgresql_where=text("status IN ('Pending Doctor Approval', 'Scheduled')")
         )
     )
 
@@ -57,6 +60,8 @@ class Appointment(Base):
     )
 
     notes = Column(String, nullable=True)
+
+    decline_reason = Column(String, nullable=True)
 
     created_at = Column(
         DateTime(timezone=True),

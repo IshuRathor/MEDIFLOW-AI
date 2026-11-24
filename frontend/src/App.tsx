@@ -7,6 +7,8 @@ import {
   createDoctor,
   createPatient,
   cancelAppointment,
+  acceptAppointmentRequest,
+  declineAppointmentRequest,
   createAppointment,
   createBill,
   createPayment,
@@ -434,6 +436,7 @@ function PatientBooking({
   const [message, setMessage] = useState('')
   const [error, setError] = useState('')
   const [booking, setBooking] = useState(false)
+  const [reason, setReason] = useState('')
 
   async function loadSlots() {
     if (!doctorId || !targetDate) return
@@ -456,10 +459,10 @@ function PatientBooking({
     setError('')
     setMessage('')
     try {
-      const appointment = await createAppointment(token, { patient_id: 0, doctor_id: Number(doctorId), appointment_date: selectedSlot })
+      const appointment = await createAppointment(token, { patient_id: 0, doctor_id: Number(doctorId), appointment_date: selectedSlot, reason: reason.trim() || undefined })
       const doctor = doctors.find((item) => item.id === Number(doctorId))
       const date = new Date(appointment.appointment_date)
-      setMessage(`Your appointment has been booked successfully! Dr. ${doctor?.name ?? 'your doctor'} — ${date.toLocaleDateString()} at ${date.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}`)
+      setMessage(`Request #${appointment.id} is awaiting doctor approval. Dr. ${doctor?.name ?? 'your doctor'} — ${date.toLocaleDateString()} at ${date.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}`)
       await loadSlots()
       setSelectedSlot('')
       onBooked()
@@ -478,17 +481,39 @@ function PatientBooking({
     <div className="resource-form">
       <label>Doctor<select required value={doctorId} onChange={(event) => setDoctorId(event.target.value)}><option value="">Select doctor</option>{doctors.map((doctor) => <option value={doctor.id} key={doctor.id}>Dr. {doctor.name} — {doctor.specialization}</option>)}</select></label>
       <label>Date<input required type="date" value={targetDate} onChange={(event) => setTargetDate(event.target.value)} /></label>
+      <label>Reason for appointment<input value={reason} onChange={(event) => setReason(event.target.value)} placeholder="Optional" /></label>
       <button className="outline-button" type="button" disabled={!doctorId || !targetDate} onClick={() => void loadSlots()}>View slots</button>
       {slots.length > 0 && <div className="slot-grid">{slots.map((slot) => <button type="button" key={slot.start} disabled={slot.status !== 'available'} className={selectedSlot === slot.start ? 'slot-option selected' : 'slot-option'} onClick={() => setSelectedSlot(slot.start)}><strong>{new Date(slot.start).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}</strong><span>{slot.status}</span></button>)}</div>}
       {error && <p className="form-error" role="alert">{error}</p>}
       {message && <p className="auth-message" role="status">{message}</p>}
-      <button className="dark-button" type="button" disabled={!selectedSlot || booking} onClick={() => void book()}>{booking ? 'Booking…' : 'Confirm booking'} <span>→</span></button>
+      <button className="dark-button" type="button" disabled={!selectedSlot || booking} onClick={() => void book()}>{booking ? 'Sending request…' : 'Request appointment'} <span>→</span></button>
     </div>
   </article>
 }
 
 function MetricCard({ label, value, tone = 'metric-light' }: { label: string; value: string | number; tone?: string }) {
   return <article className={`metric-card ${tone}`}><div className="metric-label">{label}</div><strong>{value}</strong></article>
+}
+
+function AppointmentRequestsPanel({ requests, token, onUpdated }: { requests: Array<Record<string, unknown>>; token: string; onUpdated: () => void }) {
+  const [busyId, setBusyId] = useState<number | null>(null)
+  const [error, setError] = useState('')
+  async function decide(id: number, action: 'accept' | 'decline') {
+    const reason = action === 'decline' ? window.prompt('Optional reason for declining this request:') : undefined
+    if (action === 'decline' && reason === null) return
+    setBusyId(id)
+    setError('')
+    try {
+      if (action === 'accept') await acceptAppointmentRequest(id, token)
+      else await declineAppointmentRequest(id, token, reason?.trim() || undefined)
+      onUpdated()
+    } catch (requestError) {
+      setError(requestError instanceof Error ? requestError.message : 'The request could not be processed.')
+    } finally {
+      setBusyId(null)
+    }
+  }
+  return <article className="panel queue-panel"><div className="panel-heading"><div><p className="eyebrow">Doctor review</p><h2>Appointment Requests</h2></div></div>{requests.length === 0 ? <p className="dashboard-state">No appointment requests are waiting for review.</p> : <div className="resource-list">{requests.map((item) => <div className="resource-row" key={String(item.id)}><strong>Request #{String(item.id)} · {String(item.patient_name)}</strong><span>{new Date(String(item.appointment_date)).toLocaleString()} · {String(item.department ?? 'Department not assigned')}</span><span>{String(item.reason ?? 'General consultation')}</span><span>Requested {item.created_at ? new Date(String(item.created_at)).toLocaleString() : 'time unavailable'} · {String(item.status)}</span><div className="approval-actions"><button className="dark-button" type="button" disabled={busyId !== null} onClick={() => void decide(Number(item.id), 'accept')}>{busyId === Number(item.id) ? 'Saving…' : 'Accept'}</button><button className="outline-button" type="button" disabled={busyId !== null} onClick={() => void decide(Number(item.id), 'decline')}>Decline</button></div></div>)}</div>}{error && <p className="form-error" role="alert">{error}</p>}</article>
 }
 
 function RoleDashboard({
@@ -499,6 +524,7 @@ function RoleDashboard({
   token,
   doctors,
   onDashboardRefresh,
+  onAskAI,
 }: {
   data: RoleDashboardData | null
   loading: boolean
@@ -507,6 +533,7 @@ function RoleDashboard({
   token: string
   doctors: DoctorRecord[]
   onDashboardRefresh: () => void
+  onAskAI: () => void
 }) {
   if (loading) return <p className="dashboard-state">Loading role dashboard…</p>
   if (error) return <p className="form-error" role="alert">{error}</p>
@@ -516,36 +543,45 @@ function RoleDashboard({
     const stats = data.stats as Record<string, number>
     const schedule = (data.today_schedule ?? []) as Array<Record<string, unknown>>
     const patients = (data.assigned_patients ?? []) as Array<Record<string, unknown>>
+    const pendingRequests = (data.pending_requests ?? []) as Array<Record<string, unknown>>
+    const pastAppointments = (data.past_appointments ?? []) as Array<Record<string, unknown>>
     return <>
       <section className="metrics-grid" aria-label="Doctor metrics">
         <MetricCard label="Today's appointments" value={stats.todays_appointments ?? 0} tone="metric-dark" />
         <MetricCard label="Upcoming appointments" value={stats.upcoming_appointments ?? 0} tone="metric-coral" />
         <MetricCard label="Assigned patients" value={stats.assigned_patients ?? 0} tone="metric-lime" />
         <MetricCard label="Completed consultations" value={stats.completed_consultations ?? 0} />
+        <MetricCard label="Appointment requests" value={stats.pending_requests ?? 0} tone="metric-coral" />
       </section>
       <section className="metrics-grid role-secondary-metrics" aria-label="Doctor status metrics">
         <MetricCard label="Pending consultations" value={stats.pending_consultations ?? 0} tone="metric-coral" />
         <MetricCard label="Cancelled appointments" value={stats.cancelled_appointments ?? 0} tone="metric-light" />
       </section>
       <section className="dashboard-grid">
+        <AppointmentRequestsPanel requests={pendingRequests} token={token} onUpdated={onDashboardRefresh} />
         <article className="panel appointments-panel"><div className="panel-heading"><div><p className="eyebrow">My schedule</p><h2>Today's appointments</h2></div></div>{schedule.length === 0 ? <p className="dashboard-state">No appointments scheduled for today.</p> : <div className="appointment-list">{schedule.map((item) => <div className="appointment-row" key={String(item.id)}><time>{new Date(String(item.appointment_date)).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}</time><div className="appointment-marker lime" /><div className="patient-info"><strong>{String(item.patient_name)}</strong><span>{String(item.reason ?? 'General consultation')}</span></div><span className="status-pill confirmed">{String(item.status)}</span></div>)}</div>}</article>
         <article className="panel capacity-panel"><div className="panel-heading"><div><p className="eyebrow">Quick actions</p><h2>Clinical tools</h2></div></div><div className="role-actions"><button className="outline-button" type="button" onClick={() => onNavigate('Patients')}>View patients</button><button className="outline-button" type="button" onClick={() => onNavigate('Appointments')}>View appointments</button></div></article>
       </section>
-      <section className="bottom-grid"><article className="panel queue-panel"><div className="panel-heading"><div><p className="eyebrow">Assigned care</p><h2>My patients</h2></div></div>{patients.length === 0 ? <p className="dashboard-state">No assigned patients yet.</p> : <div className="resource-list">{patients.map((patient) => <div className="resource-row" key={String(patient.id)}><div className="avatar avatar-light">{String(patient.name).slice(0, 2).toUpperCase()}</div><div><strong>{String(patient.name)}</strong><span>{String(patient.email ?? 'Email unavailable')}</span></div></div>)}</div>}</article><DoctorAvailabilityManager token={token} /></section>
+      <section className="bottom-grid"><article className="panel queue-panel"><div className="panel-heading"><div><p className="eyebrow">Past appointments</p><h2>Recent patient visits</h2></div></div>{pastAppointments.length === 0 ? <p className="dashboard-state">No past appointments yet.</p> : <div className="resource-list">{pastAppointments.map((item) => <div className="resource-row" key={String(item.id)}><strong>#{String(item.id)} · {String(item.patient_name)}</strong><span>{new Date(String(item.appointment_date)).toLocaleString()}</span><span>{String(item.reason ?? 'General consultation')}</span><span>{String(item.status)}</span></div>)}</div>}</article><article className="panel capacity-panel"><div className="panel-heading"><div><p className="eyebrow">Assigned care</p><h2>My patients</h2></div></div>{patients.length === 0 ? <p className="dashboard-state">No assigned patients yet.</p> : <div className="resource-list">{patients.map((patient) => <div className="resource-row" key={String(patient.id)}><div className="avatar avatar-light">{String(patient.name).slice(0, 2).toUpperCase()}</div><div><strong>{String(patient.name)}</strong><span>{String(patient.email ?? 'Email unavailable')}</span></div></div>)}</div>}</article><DoctorAvailabilityManager token={token} /></section>
     </>
   }
 
   if (data.role === 'patient') {
     const stats = data.stats as Record<string, number>
     const upcoming = (data.upcoming ?? []) as Array<Record<string, unknown>>
+    const pendingRequests = (data.pending_requests ?? []) as Array<Record<string, unknown>>
+    const declined = (data.declined ?? []) as Array<Record<string, unknown>>
+    const cancelled = (data.cancelled ?? []) as Array<Record<string, unknown>>
     const previous = (data.previous ?? []) as Array<Record<string, unknown>>
     const bills = (data.bills ?? []) as Array<Record<string, unknown>>
     const payments = (data.payments ?? []) as Array<Record<string, unknown>>
     const doctor = data.assigned_doctor as Record<string, unknown> | null
     return <>
-      <section className="metrics-grid" aria-label="Patient metrics"><MetricCard label="My upcoming appointments" value={stats.upcoming_appointments ?? 0} tone="metric-dark" /><MetricCard label="My previous appointments" value={stats.previous_appointments ?? 0} tone="metric-coral" /><MetricCard label="My bills" value={stats.bills ?? 0} tone="metric-lime" /><MetricCard label="Pending payments" value={stats.pending_payments ?? 0} /></section>
-      <section className="bottom-grid"><PatientBooking token={token} doctors={doctors} onBooked={onDashboardRefresh} /></section>
+      <section className="metrics-grid" aria-label="Patient metrics"><MetricCard label="My upcoming appointments" value={stats.upcoming_appointments ?? 0} tone="metric-dark" /><MetricCard label="Pending requests" value={stats.pending_requests ?? 0} tone="metric-coral" /><MetricCard label="My bills" value={stats.bills ?? 0} tone="metric-lime" /><MetricCard label="Pending payments" value={stats.pending_payments ?? 0} /></section>
+      <section className="bottom-grid"><article className="panel capacity-panel"><div className="panel-heading"><div><p className="eyebrow">AI appointment agent</p><h2>Find a doctor and request a time</h2></div></div><p className="capacity-copy">Ask in your own words. MediFlow checks the doctor directory and recorded availability, then asks you to review and confirm the request.</p><button className="dark-button" type="button" onClick={onAskAI}>Ask MediFlow AI <span>→</span></button></article><PatientBooking token={token} doctors={doctors} onBooked={onDashboardRefresh} /></section>
       <section className="dashboard-grid"><article className="panel appointments-panel"><div className="panel-heading"><div><p className="eyebrow">Care journey</p><h2>Upcoming appointments</h2></div></div>{upcoming.length === 0 ? <p className="dashboard-state">No upcoming appointments.</p> : <div className="appointment-list">{upcoming.map((item) => <div className="appointment-row" key={String(item.id)}><time>{new Date(String(item.appointment_date)).toLocaleString()}</time><div className="patient-info"><strong>Dr. {String(item.doctor_name)}</strong><span>{String(item.reason ?? 'General consultation')}</span></div><span className="status-pill confirmed">{String(item.status)}</span></div>)}</div>}</article><article className="panel capacity-panel"><div className="panel-heading"><div><p className="eyebrow">My care</p><h2>Assigned doctor</h2></div></div>{doctor ? <div className="capacity-copy"><strong>Dr. {String(doctor.name)}</strong><span>{String(doctor.specialization)}</span></div> : <p className="dashboard-state">No assigned doctor yet.</p>}<div className="role-actions"><button className="outline-button" type="button" onClick={() => onNavigate('Appointments')}>Book appointment</button><button className="outline-button" type="button" onClick={() => onNavigate('Billing')}>View bills</button></div></article></section>
+      <section className="dashboard-grid"><article className="panel appointments-panel"><div className="panel-heading"><div><p className="eyebrow">Request tracking</p><h2>Pending doctor approval</h2></div><button className="outline-button" type="button" onClick={onDashboardRefresh}>Refresh status</button></div>{pendingRequests.length === 0 ? <p className="dashboard-state">No pending requests.</p> : <div className="resource-list">{pendingRequests.map((item) => <div className="resource-row" key={String(item.id)}><strong>Request #{String(item.id)}</strong><span>Dr. {String(item.doctor_name)} · {new Date(String(item.appointment_date)).toLocaleString()}</span><span>{String(item.reason ?? 'General consultation')}</span><span>Pending Doctor Approval</span></div>)}</div>}</article><article className="panel capacity-panel"><div className="panel-heading"><div><p className="eyebrow">My care</p><h2>Assigned doctor</h2></div></div>{doctor ? <div className="capacity-copy"><strong>Dr. {String(doctor.name)}</strong><span>{String(doctor.specialization)}</span></div> : <p className="dashboard-state">No assigned doctor yet.</p>}<div className="role-actions"><button className="outline-button" type="button" onClick={() => onNavigate('Appointments')}>Book appointment</button><button className="outline-button" type="button" onClick={() => onNavigate('Billing')}>View bills</button></div></article></section>
+      {(declined.length > 0 || cancelled.length > 0) && <section className="bottom-grid"><article className="panel queue-panel"><div className="panel-heading"><div><p className="eyebrow">Request updates</p><h2>Declined and cancelled</h2></div></div><div className="resource-list">{[...declined, ...cancelled].map((item) => <div className="resource-row" key={String(item.id)}><strong>Request #{String(item.id)} · {String(item.status)}</strong><span>Dr. {String(item.doctor_name)} · {new Date(String(item.appointment_date)).toLocaleString()}</span><span>{String(item.reason ?? 'General consultation')}</span>{Boolean(item.decline_reason) && <span>Reason: {String(item.decline_reason)}</span>}</div>)}</div></article></section>}
       <section className="bottom-grid"><article className="panel queue-panel"><div className="panel-heading"><div><p className="eyebrow">Personal history</p><h2>Previous appointments</h2></div></div>{previous.length === 0 ? <p className="dashboard-state">No previous appointments.</p> : <div className="resource-list">{previous.map((item) => <div className="resource-row" key={String(item.id)}><strong>{new Date(String(item.appointment_date)).toLocaleDateString()}</strong><span>{String(item.reason ?? 'General consultation')}</span><span>{String(item.status)}</span></div>)}</div>}</article><article className="panel capacity-panel"><div className="panel-heading"><div><p className="eyebrow">Personal finance</p><h2>Recent bills</h2></div></div>{bills.length === 0 ? <p className="dashboard-state">No bills found.</p> : <div className="resource-list">{bills.slice(0, 6).map((bill) => <div className="resource-row" key={String(bill.id)}><strong>{String(bill.bill_number)}</strong><span>${Number(bill.total_amount).toFixed(2)}</span><span>{String(bill.status)}</span></div>)}</div>}<small>Payment history: {payments.length === 0 ? 'No payments recorded.' : `${payments.length} record(s)`}</small></article></section>
     </>
   }
@@ -732,13 +768,17 @@ function App() {
     setChatError('')
     try {
       const response = await decideAIApproval(chatResponse.approval_id, decision, token)
+      const resultMessage = response.result?.status === 'Pending Doctor Approval' && response.result?.appointment_id
+        ? `Appointment request #${String(response.result.appointment_id)} submitted. Status: Pending Doctor Approval. Waiting for doctor approval.`
+        : String(response.result?.message ?? (decision === 'approve' ? 'Operation completed.' : 'Operation rejected.'))
       setChatResponse({
         ...chatResponse,
         status: 'completed',
-        message: String(response.result?.message ?? (decision === 'approve' ? 'Operation completed.' : 'Operation rejected.')),
+        message: resultMessage,
         approval_id: null,
         data: response.result ?? {},
       })
+      if (currentUser) void getRoleDashboard(token, currentUser.role).then(setRoleDashboard)
     } catch (error) {
       setChatError(error instanceof Error ? error.message : 'The approval could not be processed.')
     } finally {
@@ -794,8 +834,10 @@ function App() {
             onNavigate={setActiveNav}
             token={token}
             doctors={doctors}
+            onAskAI={() => setChatOpen(true)}
             onDashboardRefresh={() => {
-              void getRoleDashboard(token, 'patient').then(setRoleDashboard).catch((requestError) => setDataError(requestError instanceof Error ? requestError.message : 'Dashboard could not be refreshed'))
+              if (!currentUser) return
+              void getRoleDashboard(token, currentUser.role).then(setRoleDashboard).catch((requestError) => setDataError(requestError instanceof Error ? requestError.message : 'Dashboard could not be refreshed'))
             }}
           />
           </>}
@@ -822,7 +864,8 @@ function App() {
           {chatResponse && <div className="chat-response">
             <strong>{chatResponse.agent ?? 'MyDFlow AI'}</strong>
             <p>{chatResponse.message ?? 'The assistant returned a structured operational result.'}</p>
-            {chatResponse.status === 'approval_required' && chatResponse.approval_id && <div className="approval-actions"><button className="dark-button" type="button" disabled={approvalLoading} onClick={() => void decideApproval('approve')}>{approvalLoading ? 'Processing…' : 'Approve'} <span>→</span></button><button className="outline-button" type="button" disabled={approvalLoading} onClick={() => void decideApproval('reject')}>Cancel</button></div>}
+            {Array.isArray(chatResponse.data.doctors) && <div className="resource-list">{(chatResponse.data.doctors as Array<Record<string, unknown>>).map((doctor) => <div className="resource-row" key={String(doctor.id)}><strong>Dr. {String(doctor.name)}</strong><span>{String(doctor.specialization)} · {String(doctor.department ?? 'Department not assigned')}</span>{Array.isArray(doctor.availability) && <span>{(doctor.availability as Array<Record<string, unknown>>).map((rule) => `${String(rule.specific_date ?? rule.day)} ${String(rule.start_time)}–${String(rule.end_time)}`).join(' · ') || 'No availability schedule on file'}</span>}</div>)}</div>}
+            {chatResponse.status === 'approval_required' && chatResponse.approval_id && <div className="approval-actions"><button className="dark-button" type="button" disabled={approvalLoading} onClick={() => void decideApproval('approve')}>{approvalLoading ? 'Processing…' : chatResponse.trace.some((item) => item.tool === 'create_appointment') ? 'Confirm and send request' : 'Approve'} <span>→</span></button><button className="outline-button" type="button" disabled={approvalLoading} onClick={() => void decideApproval('reject')}>Cancel</button></div>}
             <small>{chatResponse.status === 'completed' ? 'Completed' : chatResponse.status === 'clarification_required' ? 'Clarification needed' : chatResponse.status === 'approval_required' ? 'Waiting for approval' : 'Request error'}</small>
             {chatResponse.trace.length > 0 && <small>{chatResponse.trace.map((item) => `${item.tool}: ${item.status}`).join(' · ')}</small>}
           </div>}

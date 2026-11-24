@@ -11,7 +11,7 @@ from sqlalchemy.orm import Session
 from app.agents.main_agent import client
 from app.ai.tool_registry import ToolRegistry
 from app.models.ai import AIApproval, AIConversationMessage
-from app.models.appointment import Appointment
+from app.models.appointment import Appointment, ACTIVE_APPOINTMENT_STATUSES
 from app.models.availability import DoctorAvailability
 from app.models.doctor import Doctor
 from app.models.finance import Bill, Expense, Payment
@@ -20,7 +20,7 @@ from app.services.triage_service import triage_patient
 from app.api.availability import generate_slots
 
 
-MAX_HISTORY_MESSAGES = 8
+MAX_HISTORY_MESSAGES = 20
 MAX_TOOL_CALLS = 6
 logger = logging.getLogger(__name__)
 
@@ -376,7 +376,7 @@ def _conversation_history(db: Session, user_id: int, conversation_id: str) -> li
             AIConversationMessage.user_id == user_id,
             AIConversationMessage.conversation_id == conversation_id,
         )
-        .order_by(AIConversationMessage.created_at.desc())
+        .order_by(AIConversationMessage.created_at.desc(), AIConversationMessage.id.desc())
         .limit(MAX_HISTORY_MESSAGES)
         .all()
     )
@@ -492,7 +492,7 @@ def _create_pending_approval(db: Session, user, conversation_id: str, action: st
     return approval
 
 
-def _proposal_create_appointment(db: Session, user, patient_id: int, doctor_id: int, appointment_date: str, appointment_time: str):
+def _proposal_create_appointment(db: Session, user, patient_id: int, doctor_id: int, appointment_date: str, appointment_time: str, reason: str | None = None):
     if user.role not in ("admin", "staff", "clinician", "patient"):
         return {"status": "error", "message": "You do not have permission to propose an appointment"}
     patient = db.query(Patient).filter(Patient.id == patient_id).first()
@@ -515,6 +515,26 @@ def _proposal_create_appointment(db: Session, user, patient_id: int, doctor_id: 
     except ValueError:
         return {"status": "error", "message": "Use YYYY-MM-DD and HH:MM for appointment date and time"}
 
+    if appointment_datetime <= datetime.now():
+        return {"status": "error", "message": "Past appointments cannot be requested"}
+    slots = generate_slots(db, doctor.id, appointment_datetime.date())
+    if slots["blocked"]:
+        return {"status": "error", "message": "The doctor is unavailable on that date", "alternatives": slots["alternatives"]}
+    if not any(slot["status"] == "available" and slot["start"] == appointment_datetime.isoformat() for slot in slots["slots"]):
+        available = [slot["start"] for slot in slots["slots"] if slot["status"] == "available"]
+        return {"status": "error", "message": "That slot is unavailable", "alternatives": available[:5] or slots["alternatives"]}
+    if user.role == "patient":
+        overlap = db.query(Appointment).filter(
+            Appointment.patient_id == patient.id,
+            Appointment.status.in_(ACTIVE_APPOINTMENT_STATUSES),
+        ).all()
+        duration = max(doctor.appointment_duration_minutes or 30, 5)
+        requested_end = appointment_datetime + timedelta(minutes=duration)
+        for existing in overlap:
+            existing_start = existing.appointment_date.replace(tzinfo=None) if existing.appointment_date.tzinfo else existing.appointment_date
+            if appointment_datetime < existing_start + timedelta(minutes=duration) and requested_end > existing_start:
+                return {"status": "error", "message": "You already have an appointment at that time"}
+
     approval = None
     return {
         "status": "clarification_required",
@@ -522,6 +542,7 @@ def _proposal_create_appointment(db: Session, user, patient_id: int, doctor_id: 
         "patient": {"id": patient.id, "name": patient.name},
         "doctor": {"id": doctor.id, "name": doctor.name},
         "appointment_datetime": appointment_datetime.isoformat(),
+        "reason": reason,
     }
 
 
@@ -564,6 +585,7 @@ def _build_registry() -> ToolRegistry:
                 "doctor_id": {"type": "integer"},
                 "appointment_date": {"type": "string"},
                 "appointment_time": {"type": "string"},
+                "reason": {"type": "string"},
             },
             "required": ["patient_id", "doctor_id", "appointment_date", "appointment_time"],
         },
@@ -865,11 +887,18 @@ def _store_pending_action(db: Session, user, conversation_id: str, action: str, 
             f"{parameters['appointment_date']} {parameters['appointment_time']}",
             "%Y-%m-%d %H:%M",
         )
+        subject = "Appointment request summary" if user.role == "patient" else "Appointment summary"
+        next_step = (
+            "Confirm to submit this request to the doctor. It will remain pending until the doctor accepts it."
+            if user.role == "patient"
+            else "Confirm to create the appointment in the existing scheduling workflow."
+        )
         message = (
-            f"Dr. {doctor.name if doctor else 'Unknown'} is available at "
+            f"{subject}: Dr. {doctor.name if doctor else 'Unknown'}"
+            f" ({doctor.specialization}, {doctor.department or 'department not assigned'}) at "
             f"{appointment_date.strftime('%I:%M %p').lower()} on "
             f"{appointment_date.strftime('%A, %B %d, %Y')}. "
-            "Would you like me to confirm this appointment?"
+            f"Reason: {parameters.get('reason') or 'General consultation'}. {next_step}"
         )
     else:
         message = f"Confirm {action.replace('_', ' ')}: {parameters}?"
@@ -886,6 +915,168 @@ def _store_pending_action(db: Session, user, conversation_id: str, action: str, 
         }],
         "approval_id": approval.id,
     }
+
+
+def _patient_appointment_conversation(db: Session, user, conversation_id: str, query: str, history: list[dict]):
+    past_user_text = [item["content"] for item in history if item.get("role") == "user"]
+    context = " ".join([*past_user_text, query])
+    if any(word in query.lower() for word in ("alternative", "alternatives", "declined")):
+        patient = db.query(Patient).filter(Patient.user_id == user.id).first()
+        declined = db.query(Appointment).filter(
+            Appointment.patient_id == patient.id if patient else Appointment.id == -1,
+            Appointment.status == "Declined",
+        ).order_by(Appointment.created_at.desc()).first()
+        if declined:
+            doctor = db.query(Doctor).filter(Doctor.id == declined.doctor_id).first()
+            slots = generate_slots(db, declined.doctor_id, declined.appointment_date.date())
+            available = [
+                datetime.fromisoformat(slot["start"]).strftime("%I:%M %p").lower()
+                for slot in slots["slots"]
+                if slot["status"] == "available" and datetime.fromisoformat(slot["start"]) > datetime.now()
+            ]
+            return {
+                "conversation_id": conversation_id,
+                "agent": "Hospital Operations Agent",
+                "status": "completed" if available else "clarification_required",
+                "message": (f"Request #{declined.id} was declined. Dr. {doctor.name if doctor else 'your doctor'} has these open times on {declined.appointment_date.date()}: {', '.join(available)}. Tell me the time and reason to prepare a new request." if available else f"Request #{declined.id} was declined and no later slots are open with that doctor on the requested date. Available alternative dates: {', '.join(slots['alternatives']) or 'none currently listed'}. Choose a different doctor or date and I will check the schedule."),
+                "data": {"declined_request_id": declined.id, "doctor_id": declined.doctor_id, "alternatives": available or slots["alternatives"]},
+                "trace": [{"tool": "find_available_slots", "status": "success", "duration_ms": 0}],
+                "approval_id": None,
+            }
+    current_doctor = _resolve_doctor(db, query)
+    doctor_result = current_doctor if current_doctor else _resolve_doctor(db, context)
+
+    continuing_booking = bool(history and history[-1].get("role") == "assistant" and any(
+        phrase in history[-1].get("content", "").lower()
+        for phrase in ("choose a doctor", "what date", "what time", "which time", "choose one of these times", "choose another date", "reason for this appointment", "tell me the time")
+    ))
+    search_only = not continuing_booking and not any(word in query.lower() for word in ("book", "schedule", "request", "slot", "availability"))
+    if search_only:
+        doctors = [doctor_result] if doctor_result and not isinstance(doctor_result, tuple) else (doctor_result[1] if isinstance(doctor_result, tuple) else db.query(Doctor).order_by(Doctor.name.asc()).limit(100).all())
+        rows = []
+        for item in doctors:
+            availability = db.query(DoctorAvailability).filter(
+                DoctorAvailability.doctor_id == item.id,
+                DoctorAvailability.is_available == True,
+            ).order_by(DoctorAvailability.day_of_week.asc(), DoctorAvailability.start_time.asc()).all()
+            rows.append({
+                "id": item.id, "name": item.name, "specialization": item.specialization, "department": item.department,
+                "availability": [{"day": rule.day_of_week, "specific_date": rule.specific_date.isoformat() if rule.specific_date else None, "start_time": rule.start_time.strftime("%H:%M"), "end_time": rule.end_time.strftime("%H:%M")} for rule in availability],
+            })
+        return {
+            "conversation_id": conversation_id, "agent": "Hospital Operations Agent", "status": "completed",
+            "message": "Doctors and their recorded schedules are listed below. Tell me a doctor's name and preferred date to see open appointment slots.",
+            "data": {"doctors": rows}, "trace": [{"tool": "search_doctors", "status": "success", "duration_ms": 0}], "approval_id": None,
+        }
+
+    if doctor_result and isinstance(doctor_result, tuple):
+        doctors = doctor_result[1]
+        return {
+            "conversation_id": conversation_id,
+            "agent": "Hospital Operations Agent",
+            "status": "clarification_required",
+            "message": "I found more than one matching doctor. Choose one by name:",
+            "data": {"doctors": [{"id": item.id, "name": item.name, "specialization": item.specialization, "department": item.department} for item in doctors]},
+            "trace": [{"tool": "search_doctors", "status": "success", "duration_ms": 0}],
+            "approval_id": None,
+        }
+    if not doctor_result:
+        doctors = db.query(Doctor).order_by(Doctor.name.asc()).limit(100).all()
+        rows = []
+        for item in doctors:
+            availability = db.query(DoctorAvailability).filter(
+                DoctorAvailability.doctor_id == item.id,
+                DoctorAvailability.is_available == True,
+            ).order_by(DoctorAvailability.day_of_week.asc(), DoctorAvailability.start_time.asc()).all()
+            rows.append({
+                "id": item.id,
+                "name": item.name,
+                "specialization": item.specialization,
+                "department": item.department,
+                "availability": [{"day": rule.day_of_week, "specific_date": rule.specific_date.isoformat() if rule.specific_date else None, "start_time": rule.start_time.strftime("%H:%M"), "end_time": rule.end_time.strftime("%H:%M")} for rule in availability],
+            })
+        return {
+            "conversation_id": conversation_id,
+            "agent": "Hospital Operations Agent",
+            "status": "clarification_required",
+            "message": "Choose a doctor from the real doctor directory below. Availability shown is the schedule on file; tell me your preferred date to check open slots.",
+            "data": {"doctors": rows},
+            "trace": [{"tool": "search_doctors", "status": "success", "duration_ms": 0}],
+            "approval_id": None,
+        }
+
+    target_date = _extract_date(query) or _extract_date(context)
+    if not target_date:
+        return {
+            "conversation_id": conversation_id,
+            "agent": "Hospital Operations Agent",
+            "status": "clarification_required",
+            "message": f"What date would you prefer for Dr. {doctor_result.name}?",
+            "data": {"doctor": {"id": doctor_result.id, "name": doctor_result.name, "specialization": doctor_result.specialization, "department": doctor_result.department}},
+            "trace": [],
+            "approval_id": None,
+        }
+
+    target_time = _extract_time(query) or _extract_time(context)
+    slot_result = generate_slots(db, doctor_result.id, datetime.strptime(target_date, "%Y-%m-%d").date())
+    available_slots = [
+        slot for slot in slot_result["slots"]
+        if slot["status"] == "available" and datetime.fromisoformat(slot["start"]) > datetime.now()
+    ]
+    if slot_result["blocked"]:
+        return {
+            "conversation_id": conversation_id,
+            "agent": "Hospital Operations Agent",
+            "status": "clarification_required",
+            "message": f"Dr. {doctor_result.name} has blocked {target_date}. Available dates: {', '.join(slot_result['alternatives']) or 'none currently listed'}. Choose another date.",
+            "data": {"alternatives": slot_result["alternatives"]}, "trace": [], "approval_id": None,
+        }
+    if not target_time:
+        available = [datetime.fromisoformat(slot["start"]).strftime("%I:%M %p").lower() for slot in available_slots]
+        return {
+            "conversation_id": conversation_id,
+            "agent": "Hospital Operations Agent",
+            "status": "clarification_required",
+            "message": f"Available slots for Dr. {doctor_result.name} on {target_date}: {', '.join(available) or 'none'}. Which time would you like?",
+            "data": {"doctor": {"id": doctor_result.id, "name": doctor_result.name, "specialization": doctor_result.specialization, "department": doctor_result.department}, "date": target_date, "available_slots": [slot["start"] for slot in available_slots]},
+            "trace": [{"tool": "find_available_slots", "status": "success", "duration_ms": 0}], "approval_id": None,
+        }
+    matching = next((slot for slot in available_slots if datetime.fromisoformat(slot["start"]).strftime("%H:%M") == target_time), None)
+    if not matching:
+        alternatives = [datetime.fromisoformat(slot["start"]).strftime("%I:%M %p").lower() for slot in available_slots]
+        return {
+            "conversation_id": conversation_id,
+            "agent": "Hospital Operations Agent",
+            "status": "clarification_required",
+            "message": f"That time is not available. Open slots for Dr. {doctor_result.name} on {target_date}: {', '.join(alternatives) or 'none'}. Choose one of these times.",
+            "data": {"alternatives": alternatives}, "trace": [], "approval_id": None,
+        }
+
+    reason_match = re.search(r"\b(?:reason is|because of|because|for)\s+(?:a|an|the|my)?\s*([a-z][a-z -]{2,})", context, re.I)
+    reason = reason_match.group(1).strip(" .,!?") if reason_match else None
+    if not reason and history and history[-1].get("role") == "assistant" and "reason for this appointment" in history[-1].get("content", "").lower():
+        reason = query.strip(" .,!?")
+    if reason and reason.lower() in {"tomorrow", "today", "monday", "tuesday", "wednesday", "thursday", "friday", "saturday", "sunday"}:
+        reason = None
+    if not reason:
+        return {
+            "conversation_id": conversation_id,
+            "agent": "Hospital Operations Agent",
+            "status": "clarification_required",
+            "message": "What is the reason for this appointment?",
+            "data": {"doctor": {"id": doctor_result.id, "name": doctor_result.name}, "date": target_date, "time": target_time},
+            "trace": [], "approval_id": None,
+        }
+    patient = db.query(Patient).filter(Patient.user_id == user.id).first()
+    if not patient:
+        return {"conversation_id": conversation_id, "agent": "Hospital Operations Agent", "status": "error", "message": "No patient profile is linked to this account.", "data": {}, "trace": [], "approval_id": None}
+    return _store_pending_action(db, user, conversation_id, "create_appointment", {
+        "patient_id": patient.id,
+        "doctor_id": doctor_result.id,
+        "appointment_date": target_date,
+        "appointment_time": target_time,
+        "reason": reason,
+    })
 
 
 def _determine_write_action(db: Session, user, conversation_id: str, name: str, arguments: dict) -> dict | None:
@@ -1092,6 +1283,7 @@ def _determine_write_action(db: Session, user, conversation_id: str, name: str, 
             int(arguments["doctor_id"]),
             str(arguments["appointment_date"]),
             str(arguments["appointment_time"]),
+            str(arguments["reason"]) if arguments.get("reason") else None,
         )
         if result["status"] == "error":
             return {
@@ -1113,6 +1305,7 @@ def _determine_write_action(db: Session, user, conversation_id: str, name: str, 
                 "doctor_id": int(arguments["doctor_id"]),
                 "appointment_date": str(arguments["appointment_date"]),
                 "appointment_time": str(arguments["appointment_time"]),
+                "reason": str(arguments["reason"]) if arguments.get("reason") else None,
             },
         )
     return None
@@ -1217,6 +1410,23 @@ def run_orchestrator(db: Session, user, query: str, conversation_id: str | None 
         }
         _store_message(db, user.id, conversation_id, "assistant", response["message"], response["trace"])
         return response
+
+    if user.role == "patient":
+        prior_booking = bool(history and history[-1].get("role") == "assistant" and any(
+            phrase in history[-1].get("content", "").lower()
+            for phrase in ("choose a doctor", "what date", "what time", "which time", "choose one of these times", "choose another date", "reason for this appointment", "tell me the time")
+        ))
+        query_lowered = query.lower()
+        booking_or_search = (
+            any(word in query_lowered for word in ("book", "schedule", "request an appointment", "want an appointment", "need an appointment"))
+            or prior_booking
+            or any(word in query_lowered for word in ("alternative", "alternatives", "declined"))
+            or (("find" in query_lowered or "show" in query_lowered or "search" in query_lowered) and any(word in query_lowered for word in ("doctor", "cardiologist", "dermatologist", "neurologist", "orthopedic", "cardiology")))
+        )
+        if prior_booking or booking_or_search:
+            response = _patient_appointment_conversation(db, user, conversation_id, query, history)
+            _store_message(db, user.id, conversation_id, "assistant", response["message"], response.get("trace"))
+            return response
 
     try:
         first_response = _gemini_response(query, history)

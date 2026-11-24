@@ -137,8 +137,9 @@ export type AppointmentRecord = {
   doctor_id: number
   appointment_date: string
   reason: string | null
-  status: 'Scheduled' | 'Completed' | 'Cancelled' | 'No-show'
+  status: 'Pending Doctor Approval' | 'Scheduled' | 'Declined' | 'Completed' | 'Cancelled' | 'No-show'
   notes: string | null
+  decline_reason?: string | null
   created_at: string
 }
 
@@ -222,6 +223,28 @@ export type RoleDashboardData = {
 export function getRoleDashboard(token: string, role: UserRecord['role']): Promise<RoleDashboardData> {
   const route = role === 'clinician' ? 'doctor' : role === 'patient' ? 'patient' : role === 'staff' ? 'finance' : 'admin'
   return get<RoleDashboardData>(`/dashboard/${route}`, token)
+}
+
+async function processAppointmentRequest(appointmentId: number, action: 'accept' | 'decline', token: string, reason?: string): Promise<AppointmentRecord> {
+  const response = await fetch(`${API_BASE_URL}/appointments/${appointmentId}/${action}`, {
+    method: 'POST',
+    headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' },
+    body: action === 'decline' ? JSON.stringify({ reason: reason ?? null }) : undefined,
+  })
+  if (!response.ok) {
+    const body = await response.json().catch(() => null) as { detail?: string } | null
+    throw new Error(body?.detail ?? 'The appointment request could not be processed.')
+  }
+  const result = await response.json() as { appointment: AppointmentRecord }
+  return result.appointment
+}
+
+export function acceptAppointmentRequest(appointmentId: number, token: string): Promise<AppointmentRecord> {
+  return processAppointmentRequest(appointmentId, 'accept', token)
+}
+
+export function declineAppointmentRequest(appointmentId: number, token: string, reason?: string): Promise<AppointmentRecord> {
+  return processAppointmentRequest(appointmentId, 'decline', token, reason)
 }
 export async function createAppointment(token: string, input: AppointmentInput): Promise<AppointmentRecord> {
   const query = new URLSearchParams({

@@ -1,11 +1,12 @@
-from fastapi import APIRouter, Depends, HTTPException, Query
+from fastapi import APIRouter, Body, Depends, HTTPException, Query
 from sqlalchemy.orm import Session
 from sqlalchemy.exc import IntegrityError
+from sqlalchemy import update
 from datetime import datetime, timedelta, timezone
 from typing import Literal
 
 from app.database.db import SessionLocal
-from app.models.appointment import Appointment
+from app.models.appointment import Appointment, ACTIVE_APPOINTMENT_STATUSES
 from app.models.patient import Patient
 from app.models.doctor import Doctor
 from app.models.availability import DoctorAvailability
@@ -16,6 +17,7 @@ from app.schemas.scheduling import (
 )
 from app.core.security import get_current_user, get_linked_doctor
 from app.models.user import User
+from pydantic import BaseModel, Field
 from app.api.availability import generate_slots, _datetime_naive
 
 
@@ -23,6 +25,24 @@ router = APIRouter(
     prefix="/appointments",
     tags=["Appointments"]
 )
+
+
+class DeclineAppointmentRequest(BaseModel):
+    reason: str | None = Field(default=None, max_length=500)
+
+
+def _appointment_response(item: Appointment):
+    return {
+        "id": item.id,
+        "patient_id": item.patient_id,
+        "doctor_id": item.doctor_id,
+        "appointment_date": item.appointment_date,
+        "reason": item.reason,
+        "status": item.status,
+        "notes": item.notes,
+        "decline_reason": item.decline_reason,
+        "created_at": item.created_at,
+    }
 
 
 def get_db():
@@ -135,7 +155,7 @@ def create_appointment(
         raise HTTPException(status_code=409, detail={"message": "This appointment slot is already booked.", "alternatives": alternatives})
 
     active_appointments = db.query(Appointment).filter(
-        Appointment.status == "Scheduled",
+        Appointment.status.in_(ACTIVE_APPOINTMENT_STATUSES),
         Appointment.doctor_id == doctor_id,
     ).all()
     for existing in active_appointments:
@@ -147,7 +167,7 @@ def create_appointment(
 
     patient_conflict = db.query(Appointment).filter(
         Appointment.patient_id == patient_id,
-        Appointment.status == "Scheduled",
+        Appointment.status.in_(ACTIVE_APPOINTMENT_STATUSES),
     ).all()
     for existing in patient_conflict:
         existing_start = _datetime_naive(existing.appointment_date)
@@ -165,7 +185,7 @@ def create_appointment(
         appointment_date=appointment_datetime,
         reason=reason,
         notes=notes,
-        status="Scheduled"
+        status="Pending Doctor Approval" if current_user.role == "patient" else "Scheduled"
     )
 
     db.add(new_appointment)
@@ -180,7 +200,7 @@ def create_appointment(
     db.refresh(new_appointment)
 
     return {
-        "message": "Appointment created successfully",
+        "message": "Appointment request submitted and waiting for doctor approval" if current_user.role == "patient" else "Appointment created successfully",
         "appointment": {
             "id": new_appointment.id,
             "patient_id": new_appointment.patient_id,
@@ -189,6 +209,7 @@ def create_appointment(
             "reason": new_appointment.reason,
             "status": new_appointment.status,
             "notes": new_appointment.notes,
+            "decline_reason": new_appointment.decline_reason,
             "created_at": new_appointment.created_at
         }
     }
@@ -236,6 +257,7 @@ def get_appointments(
             "reason": appointment.reason,
             "status": appointment.status,
             "notes": appointment.notes,
+            "decline_reason": appointment.decline_reason,
             "created_at": appointment.created_at
         }
         for appointment in appointments
@@ -278,6 +300,7 @@ def get_appointment(
         "reason": appointment.reason,
         "status": appointment.status,
         "notes": appointment.notes,
+        "decline_reason": appointment.decline_reason,
         "created_at": appointment.created_at
     }
 
@@ -293,7 +316,7 @@ def get_appointment(
 def update_appointment(
     appointment_id: int,
     appointment_date: str,
-    status: Literal["Scheduled", "Completed", "Cancelled", "No-show"],
+    status: Literal["Scheduled", "Completed", "Cancelled", "No-show", "Declined"],
     reason: str | None = None,
     notes: str | None = None,
     db: Session = Depends(get_db),
@@ -312,10 +335,13 @@ def update_appointment(
         owned_patient = db.query(Patient).filter(Patient.user_id == current_user.id).first()
         if not owned_patient or appointment.patient_id != owned_patient.id:
             raise HTTPException(status_code=403, detail="You can only change your own appointments")
+        raise HTTPException(status_code=403, detail="Patients can cancel appointments but cannot change appointment status")
     if current_user.role == "clinician":
         linked_doctor = get_linked_doctor(db, current_user)
         if appointment.doctor_id != linked_doctor.id:
             raise HTTPException(status_code=403, detail="You can only change your own appointments")
+        if appointment.status == "Pending Doctor Approval":
+            raise HTTPException(status_code=409, detail="Use the appointment request accept or decline action")
 
     # --------------------------------------------------------
     # Validate appointment date
@@ -382,7 +408,7 @@ def update_appointment(
         doctor_conflict = db.query(Appointment).filter(
             Appointment.doctor_id == appointment.doctor_id,
             Appointment.appointment_date == appointment_datetime,
-            Appointment.status == "Scheduled",
+            Appointment.status.in_(ACTIVE_APPOINTMENT_STATUSES),
             Appointment.id != appointment_id
         ).first()
 
@@ -401,7 +427,7 @@ def update_appointment(
         patient_conflict = db.query(Appointment).filter(
             Appointment.patient_id == appointment.patient_id,
             Appointment.appointment_date == appointment_datetime,
-            Appointment.status == "Scheduled",
+            Appointment.status.in_(ACTIVE_APPOINTMENT_STATUSES),
             Appointment.id != appointment_id
         ).first()
 
@@ -422,6 +448,8 @@ def update_appointment(
     appointment.status = status
     appointment.reason = reason
     appointment.notes = notes
+    if status != "Declined":
+        appointment.decline_reason = None
 
     db.commit()
     db.refresh(appointment)
@@ -436,6 +464,7 @@ def update_appointment(
             "reason": appointment.reason,
             "status": appointment.status,
             "notes": appointment.notes,
+            "decline_reason": appointment.decline_reason,
             "created_at": appointment.created_at
         }
     }
@@ -473,6 +502,7 @@ def cancel_appointment(
             raise HTTPException(status_code=403, detail="You can only cancel your own appointments")
 
     appointment.status = "Cancelled"
+    appointment.decline_reason = None
 
     db.commit()
     db.refresh(appointment)
@@ -482,3 +512,79 @@ def cancel_appointment(
         "appointment_id": appointment.id,
         "status": appointment.status
     }
+
+
+def _owned_pending_appointment(db: Session, appointment_id: int, current_user: User):
+    if current_user.role != "clinician":
+        raise HTTPException(status_code=403, detail="Doctor access is required")
+    doctor = get_linked_doctor(db, current_user)
+    appointment = (
+        db.query(Appointment)
+        .filter(Appointment.id == appointment_id)
+        .with_for_update()
+        .first()
+    )
+    if not appointment:
+        raise HTTPException(status_code=404, detail="Appointment request not found")
+    if appointment.doctor_id != doctor.id:
+        raise HTTPException(status_code=403, detail="You can only process your own appointment requests")
+    if appointment.status != "Pending Doctor Approval":
+        raise HTTPException(status_code=409, detail=f"Appointment request is already {appointment.status}")
+    return appointment
+
+
+@router.post("/{appointment_id}/accept", response_model=AppointmentActionResponse)
+def accept_appointment_request(
+    appointment_id: int,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    appointment = _owned_pending_appointment(db, appointment_id, current_user)
+    if _datetime_naive(appointment.appointment_date) <= datetime.now():
+        raise HTTPException(status_code=409, detail="Appointment request has expired because its requested time has passed")
+    doctor = get_linked_doctor(db, current_user)
+    try:
+        changed = db.execute(
+            update(Appointment)
+            .where(
+                Appointment.id == appointment_id,
+                Appointment.doctor_id == doctor.id,
+                Appointment.status == "Pending Doctor Approval",
+            )
+            .values(status="Scheduled", decline_reason=None)
+        )
+        if changed.rowcount != 1:
+            db.rollback()
+            raise HTTPException(status_code=409, detail="Appointment request is already processed")
+        db.commit()
+    except IntegrityError as error:
+        db.rollback()
+        raise HTTPException(status_code=409, detail="The requested slot conflicts with another appointment") from error
+    db.refresh(appointment)
+    return {"message": "Appointment request accepted", "appointment": _appointment_response(appointment)}
+
+
+@router.post("/{appointment_id}/decline", response_model=AppointmentActionResponse)
+def decline_appointment_request(
+    appointment_id: int,
+    payload: DeclineAppointmentRequest | None = Body(default=None),
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    appointment = _owned_pending_appointment(db, appointment_id, current_user)
+    doctor = get_linked_doctor(db, current_user)
+    changed = db.execute(
+        update(Appointment)
+        .where(
+            Appointment.id == appointment_id,
+            Appointment.doctor_id == doctor.id,
+            Appointment.status == "Pending Doctor Approval",
+        )
+        .values(status="Declined", decline_reason=payload.reason.strip() if payload and payload.reason else None)
+    )
+    if changed.rowcount != 1:
+        db.rollback()
+        raise HTTPException(status_code=409, detail="Appointment request is already processed")
+    db.commit()
+    db.refresh(appointment)
+    return {"message": "Appointment request declined", "appointment": _appointment_response(appointment)}

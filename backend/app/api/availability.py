@@ -4,7 +4,7 @@ from fastapi import APIRouter, Depends, HTTPException, Query
 from sqlalchemy.orm import Session
 
 from app.core.security import get_current_user, get_db, get_linked_doctor
-from app.models.appointment import Appointment
+from app.models.appointment import Appointment, ACTIVE_APPOINTMENT_STATUSES
 from app.models.availability import DoctorAvailability
 from app.models.doctor import Doctor
 from app.models.user import User
@@ -72,7 +72,7 @@ def generate_slots(db: Session, doctor_id: int, target_date: date):
     duration = max(doctor.appointment_duration_minutes or 30, 5)
     appointments = db.query(Appointment).filter(
         Appointment.doctor_id == doctor_id,
-        Appointment.status == "Scheduled",
+        Appointment.status.in_(ACTIVE_APPOINTMENT_STATUSES),
     ).all()
 
     slots = []

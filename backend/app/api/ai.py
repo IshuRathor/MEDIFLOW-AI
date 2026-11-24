@@ -10,7 +10,7 @@ from app.infrastructure.rate_limit import enforce_rate_limit
 from app.ai.orchestrator import run_orchestrator
 from app.core.security import get_current_user, get_db, get_linked_doctor
 from app.models.ai import AIApproval, AIConversationMessage
-from app.models.appointment import Appointment
+from app.models.appointment import Appointment, ACTIVE_APPOINTMENT_STATUSES
 from app.models.availability import DoctorAvailability
 from app.api.availability import generate_slots
 from app.models.doctor import Doctor
@@ -194,7 +194,7 @@ def decide_approval(
             conflict = (
                 db.query(Appointment)
                 .filter(
-                    Appointment.status == "Scheduled",
+                    Appointment.status.in_(ACTIVE_APPOINTMENT_STATUSES),
                     Appointment.appointment_date == appointment_datetime,
                     Appointment.id != appointment.id,
                     (
@@ -209,11 +209,11 @@ def decide_approval(
                 raise HTTPException(status_code=409, detail="The patient or doctor already has an appointment at that time")
 
             appointment.appointment_date = appointment_datetime
-            appointment.status = "Scheduled"
+            appointment.status = "Pending Doctor Approval" if current_user.role == "patient" else "Scheduled"
             approval.status = "executed"
             approval.executed_at = datetime.now(timezone.utc)
             approval.execution_result_json = {
-                "message": "Appointment rescheduled successfully",
+                "message": "Appointment reschedule request submitted and waiting for doctor approval" if current_user.role == "patient" else "Appointment rescheduled successfully",
                 "appointment_id": appointment.id,
                 "appointment_date": appointment.appointment_date.isoformat(),
                 "status": appointment.status,
@@ -272,7 +272,7 @@ def decide_approval(
             conflict = (
                 db.query(Appointment)
                 .filter(
-                    Appointment.status == "Scheduled",
+                    Appointment.status.in_(ACTIVE_APPOINTMENT_STATUSES),
                     Appointment.appointment_date == appointment_datetime,
                     (
                         (Appointment.doctor_id == doctor.id)
@@ -289,15 +289,15 @@ def decide_approval(
                 patient_id=patient.id,
                 doctor_id=doctor.id,
                 appointment_date=appointment_datetime,
-                reason="AI-assisted booking",
-                status="Scheduled",
+                reason=parameters.get("reason") or "AI-assisted booking",
+                status="Pending Doctor Approval" if current_user.role == "patient" else "Scheduled",
             )
             db.add(appointment)
             approval.status = "executed"
             approval.executed_at = datetime.now(timezone.utc)
             db.flush()
             approval.execution_result_json = {
-                "message": "Appointment booked successfully",
+                "message": "Appointment request submitted and waiting for doctor approval" if current_user.role == "patient" else "Appointment booked successfully",
                 "appointment_id": appointment.id,
                 "patient_id": appointment.patient_id,
                 "doctor_id": appointment.doctor_id,

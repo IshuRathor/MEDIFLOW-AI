@@ -39,6 +39,9 @@ def _appointment_item(appointment: Appointment, db: Session):
         "reason": appointment.reason,
         "status": appointment.status,
         "notes": appointment.notes,
+        "decline_reason": appointment.decline_reason,
+        "created_at": appointment.created_at.isoformat() if appointment.created_at else None,
+        "department": doctor.department if doctor else None,
     }
 
 
@@ -116,6 +119,7 @@ def doctor_dashboard(db: Session = Depends(get_db), current_user: User = Depends
     today_appointments = [
         appointment for appointment in all_appointments
         if today_start <= _as_naive_utc(appointment.appointment_date) < tomorrow_start
+        and appointment.status == "Scheduled"
     ]
     upcoming = [
         appointment for appointment in all_appointments
@@ -125,8 +129,14 @@ def doctor_dashboard(db: Session = Depends(get_db), current_user: User = Depends
     upcoming.sort(key=lambda item: item.appointment_date)
     recent = db.query(Appointment).filter(
         Appointment.doctor_id == doctor.id,
-        Appointment.status.in_(("Completed", "Scheduled", "No-show", "Cancelled")),
+        Appointment.status.in_(("Completed", "Scheduled", "No-show", "Cancelled", "Declined")),
     ).order_by(Appointment.appointment_date.desc()).limit(8).all()
+    past_appointments = [
+        item for item in all_appointments
+        if _as_naive_utc(item.appointment_date) < datetime.now()
+        or item.status in ("Completed", "No-show", "Cancelled", "Declined")
+    ]
+    past_appointments.sort(key=lambda item: item.appointment_date, reverse=True)
     availability = db.query(DoctorAvailability).filter(
         DoctorAvailability.doctor_id == doctor.id
     ).order_by(DoctorAvailability.day_of_week.asc(), DoctorAvailability.start_time.asc()).all()
@@ -147,6 +157,7 @@ def doctor_dashboard(db: Session = Depends(get_db), current_user: User = Depends
         "stats": {
             "todays_appointments": len(today_appointments),
             "upcoming_appointments": len(upcoming),
+            "pending_requests": sum(1 for item in all_appointments if item.status == "Pending Doctor Approval"),
             "assigned_patients": len(assigned_patient_ids),
             "completed_consultations": sum(1 for item in all_appointments if item.status == "Completed"),
             "pending_consultations": sum(1 for item in all_appointments if item.status == "Scheduled"),
@@ -154,7 +165,13 @@ def doctor_dashboard(db: Session = Depends(get_db), current_user: User = Depends
         },
         "today_schedule": [_appointment_item(item, db) for item in sorted(today_appointments, key=lambda item: item.appointment_date)],
         "upcoming_appointments": [_appointment_item(item, db) for item in upcoming],
+        "pending_requests": [
+            _appointment_item(item, db)
+            for item in sorted(all_appointments, key=lambda item: item.created_at or item.appointment_date, reverse=True)
+            if item.status == "Pending Doctor Approval"
+        ],
         "recent_visits": [_appointment_item(item, db) for item in recent],
+        "past_appointments": [_appointment_item(item, db) for item in past_appointments[:10]],
         "assigned_patients": [
             {"id": patient.id, "name": patient.name, "email": patient.email, "phone": patient.phone}
             for patient in assigned_patients
@@ -182,7 +199,10 @@ def patient_dashboard(db: Session = Depends(get_db), current_user: User = Depend
     now = datetime.now()
     appointments = db.query(Appointment).filter(Appointment.patient_id == patient.id).order_by(Appointment.appointment_date.desc()).all()
     upcoming = [item for item in appointments if _as_naive_utc(item.appointment_date) >= now and item.status == "Scheduled"]
-    previous = [item for item in appointments if _as_naive_utc(item.appointment_date) < now or item.status in ("Completed", "Cancelled", "No-show")]
+    pending_requests = [item for item in appointments if item.status == "Pending Doctor Approval"]
+    declined = [item for item in appointments if item.status == "Declined"]
+    cancelled = [item for item in appointments if item.status == "Cancelled"]
+    previous = [item for item in appointments if _as_naive_utc(item.appointment_date) < now or item.status in ("Completed", "Declined", "Cancelled", "No-show")]
 
     bills = db.query(Bill).filter(Bill.patient_id == patient.id).order_by(Bill.created_at.desc()).all()
     bill_ids = [bill.id for bill in bills]
@@ -200,11 +220,15 @@ def patient_dashboard(db: Session = Depends(get_db), current_user: User = Depend
         "stats": {
             "total_appointments": len(appointments),
             "upcoming_appointments": len(upcoming),
+            "pending_requests": len(pending_requests),
             "previous_appointments": len(previous),
             "bills": len(bills),
             "pending_payments": sum(1 for bill in bills if bill.status in ("Pending", "Partially Paid")),
         },
         "upcoming": [_appointment_item(item, db) for item in sorted(upcoming, key=lambda item: item.appointment_date)],
+        "pending_requests": [_appointment_item(item, db) for item in pending_requests],
+        "declined": [_appointment_item(item, db) for item in declined],
+        "cancelled": [_appointment_item(item, db) for item in cancelled],
         "previous": [_appointment_item(item, db) for item in previous[:8]],
         "assigned_doctor": assigned_doctor,
         "bills": [

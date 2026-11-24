@@ -18,6 +18,7 @@ from app.models.user import User
 from app.models.patient import Patient
 from app.models.doctor import Doctor
 from app.models.appointment import Appointment
+from app.models.availability import DoctorAvailability
 from app.main import app
 from app.core import security
 from app.api import appointment, availability, bills, doctor, patients, payments
@@ -376,11 +377,11 @@ class ApiIntegrationTests(unittest.TestCase):
             first = self.client.post(
                 "/api/ai/chat",
                 headers=patient_headers,
-                json={"query": f"I want to book an appointment with Dr. Ritik on {target.isoformat()} at 4 PM"},
+                json={"query": f"I want to book an appointment with Dr. Ritik on {target.isoformat()} at 4 PM for a headache"},
             )
         self.assertEqual(first.status_code, 200)
         self.assertEqual(first.json()["status"], "approval_required")
-        self.assertIn("Would you like me to confirm", first.json()["message"])
+        self.assertIn("pending until the doctor accepts", first.json()["message"])
         self.assertEqual(first.json()["data"]["doctor_id"], doctor_id)
 
         approval_id = first.json()["approval_id"]
@@ -391,6 +392,57 @@ class ApiIntegrationTests(unittest.TestCase):
         self.assertEqual(approved.status_code, 200)
         self.assertEqual(approved.json()["status"], "executed")
         self.assertIn("appointment_id", approved.json()["result"])
+        self.assertEqual(approved.json()["result"]["status"], "Pending Doctor Approval")
+
+    def test_patient_ai_booking_remembers_context_and_waits_for_confirmation(self):
+        target = (datetime.now() + timedelta(days=12)).date()
+        db = self.session_factory()
+        try:
+            doctor_user = User(full_name="Context Doctor", email="context.doctor@example.com", password_hash=security.hash_password("doctor-password"), role="clinician", is_active=True, approval_status="approved")
+            patient_user = User(full_name="Context Patient", email="context.patient@example.com", password_hash=security.hash_password("patient-password"), role="patient", is_active=True, approval_status="approved")
+            db.add_all([doctor_user, patient_user])
+            db.flush()
+            doctor = Doctor(name="Context Doctor", specialization="Cardiology", department="Heart", email="context.profile@example.com", user_id=doctor_user.id)
+            patient = Patient(name="Context Patient", age=29, email="context.patient@example.com", user_id=patient_user.id)
+            db.add_all([doctor, patient])
+            db.flush()
+            db.add(DoctorAvailability(doctor_id=doctor.id, day_of_week=target.strftime("%A"), specific_date=target, start_time=datetime.strptime("09:00", "%H:%M").time(), end_time=datetime.strptime("10:00", "%H:%M").time(), is_available=True))
+            db.commit()
+        finally:
+            db.close()
+
+        login = self.client.post("/api/auth/login", json={"email": "context.patient@example.com", "password": "patient-password", "role": "patient"})
+        headers = {"Authorization": f"Bearer {login.json()['access_token']}"}
+        doctor_search = self.client.post("/api/ai/chat", headers=headers, json={"query": "Find a cardiologist"})
+        self.assertEqual(doctor_search.status_code, 200)
+        self.assertEqual(doctor_search.json()["status"], "completed")
+        self.assertEqual(doctor_search.json()["data"]["doctors"][0]["name"], "Context Doctor")
+        first = self.client.post("/api/ai/chat", headers=headers, json={"query": "I want to book an appointment"})
+        self.assertEqual(first.json()["status"], "clarification_required")
+        self.assertTrue(first.json()["data"]["doctors"])
+        conversation_id = first.json()["conversation_id"]
+
+        def ask(text):
+            return self.client.post("/api/ai/chat", headers=headers, json={"query": text, "conversation_id": conversation_id})
+
+        doctor_choice = ask("Dr. Context Doctor")
+        self.assertIn("What date", doctor_choice.json()["message"])
+        date_choice = ask(target.isoformat())
+        self.assertIn("Available slots", date_choice.json()["message"])
+        time_choice = ask("9 AM")
+        self.assertIn("reason for this appointment", time_choice.json()["message"])
+        summary = ask("headache")
+        self.assertEqual(summary.json()["status"], "approval_required")
+        self.assertIn("Confirm to submit", summary.json()["message"])
+
+        db = self.session_factory()
+        try:
+            self.assertEqual(db.query(Appointment).count(), 0)
+        finally:
+            db.close()
+        submitted = self.client.post(f"/api/ai/approvals/{summary.json()['approval_id']}/approve", headers=headers)
+        self.assertEqual(submitted.status_code, 200)
+        self.assertEqual(submitted.json()["result"]["status"], "Pending Doctor Approval")
 
     def test_available_slot_booking_succeeds_with_confirmation_data(self):
         db = self.session_factory()
@@ -427,6 +479,7 @@ class ApiIntegrationTests(unittest.TestCase):
         self.assertEqual(response.status_code, 200)
         self.assertEqual(response.json()["appointment"]["doctor_id"], doctor_id)
         self.assertEqual(response.json()["appointment"]["appointment_date"], slot)
+        self.assertEqual(response.json()["appointment"]["status"], "Pending Doctor Approval")
 
     def test_doctor_unavailable_slot_returns_exact_error(self):
         db = self.session_factory()
@@ -1376,7 +1429,8 @@ class ApiIntegrationTests(unittest.TestCase):
                 "email": "fallback-doctor@example.com",
             },
         ).json()
-        weekday = (datetime.now() + timedelta(days=1)).strftime("%A")
+        booking_date = (datetime.now() + timedelta(days=2)).date()
+        weekday = booking_date.strftime("%A")
         self.client.post(
             "/api/availability/",
             headers=self.headers,
@@ -1397,7 +1451,7 @@ class ApiIntegrationTests(unittest.TestCase):
                 headers=self.headers,
                 json={"query": f"Show availability for doctor {doctor['id']}"},
             )
-            date_text = (datetime.now() + timedelta(days=2)).strftime("%Y-%m-%d")
+            date_text = booking_date.strftime("%Y-%m-%d")
             booking = self.client.post(
                 "/api/ai/chat",
                 headers=self.headers,
@@ -1533,6 +1587,87 @@ class ApiIntegrationTests(unittest.TestCase):
         unlinked_headers = {"Authorization": f"Bearer {unlinked_login.json()['access_token']}"}
         self.assertEqual(self.client.get("/api/appointments/", headers=unlinked_headers).status_code, 403)
         self.assertEqual(self.client.get("/api/dashboard/metrics", headers=unlinked_headers).status_code, 403)
+
+    def test_doctor_request_approval_scope_status_and_decline_releases_slot(self):
+        target = (datetime.now() + timedelta(days=10)).replace(hour=0, minute=0, second=0, microsecond=0)
+        db = self.session_factory()
+        try:
+            doctor_users = [
+                User(full_name=name, email=f"{slug}.workflow@example.com", password_hash=security.hash_password("doctor-password"), role="clinician", is_active=True, approval_status="approved")
+                for name, slug in (("Workflow Doctor One", "workflow1"), ("Workflow Doctor Two", "workflow2"))
+            ]
+            patient_users = [
+                User(full_name=f"Workflow Patient {index}", email=f"workflow.patient{index}@example.com", password_hash=security.hash_password("patient-password"), role="patient", is_active=True, approval_status="approved")
+                for index in (1, 2, 3)
+            ]
+            db.add_all(doctor_users + patient_users)
+            db.flush()
+            doctors = [
+                Doctor(name=f"Workflow Doctor {index}", specialization="Cardiology", department="Heart", email=f"workflow.doctor{index}@example.com", user_id=doctor_users[index - 1].id)
+                for index in (1, 2)
+            ]
+            patients = [
+                Patient(name=f"Workflow Patient {index}", age=30, email=f"workflow.patient{index}@example.com", user_id=patient_users[index - 1].id)
+                for index in (1, 2, 3)
+            ]
+            db.add_all(doctors + patients)
+            db.flush()
+            db.add(DoctorAvailability(doctor_id=doctors[0].id, day_of_week=target.strftime("%A"), specific_date=target.date(), start_time=datetime.strptime("09:00", "%H:%M").time(), end_time=datetime.strptime("10:30", "%H:%M").time(), is_available=True))
+            requests = [
+                Appointment(patient_id=patients[0].id, doctor_id=doctors[0].id, appointment_date=target.replace(hour=9), status="Pending Doctor Approval", reason="Headache"),
+                Appointment(patient_id=patients[1].id, doctor_id=doctors[0].id, appointment_date=target.replace(hour=9, minute=30), status="Pending Doctor Approval", reason="Check-up"),
+                Appointment(patient_id=patients[2].id, doctor_id=doctors[1].id, appointment_date=target.replace(hour=10), status="Pending Doctor Approval", reason="Consultation"),
+            ]
+            db.add_all(requests)
+            db.commit()
+            request_ids = [item.id for item in requests]
+            first_doctor_id = doctors[0].id
+        finally:
+            db.close()
+
+        def auth(email, password, role):
+            response = self.client.post("/api/auth/login", json={"email": email, "password": password, "role": role})
+            self.assertEqual(response.status_code, 200)
+            return {"Authorization": f"Bearer {response.json()['access_token']}"}
+
+        doctor_one = auth("workflow1.workflow@example.com", "doctor-password", "clinician")
+        doctor_two = auth("workflow2.workflow@example.com", "doctor-password", "clinician")
+        patient_one = auth("workflow.patient1@example.com", "patient-password", "patient")
+        patient_two = auth("workflow.patient2@example.com", "patient-password", "patient")
+        patient_three = auth("workflow.patient3@example.com", "patient-password", "patient")
+
+        own_dashboard = self.client.get("/api/dashboard/doctor", headers=doctor_one)
+        self.assertEqual(own_dashboard.status_code, 200)
+        self.assertEqual([item["id"] for item in own_dashboard.json()["pending_requests"]], request_ids[:2])
+        self.assertEqual(self.client.post(f"/api/appointments/{request_ids[0]}/accept", headers=doctor_two).status_code, 403)
+
+        accepted = self.client.post(f"/api/appointments/{request_ids[0]}/accept", headers=doctor_one)
+        self.assertEqual(accepted.status_code, 200)
+        self.assertEqual(accepted.json()["appointment"]["status"], "Scheduled")
+        self.assertEqual(self.client.post(f"/api/appointments/{request_ids[0]}/accept", headers=doctor_one).status_code, 409)
+        accepted_visible = self.client.get("/api/dashboard/patient", headers=patient_one)
+        self.assertEqual(accepted_visible.status_code, 200)
+        self.assertEqual(accepted_visible.json()["upcoming"][0]["status"], "Scheduled")
+
+        declined = self.client.post(f"/api/appointments/{request_ids[1]}/decline", headers=doctor_one, json={"reason": "Doctor unavailable"})
+        self.assertEqual(declined.status_code, 200)
+        self.assertEqual(declined.json()["appointment"]["status"], "Declined")
+        patient_dashboard = self.client.get("/api/dashboard/patient", headers=patient_two)
+        self.assertEqual(patient_dashboard.status_code, 200)
+        self.assertEqual(patient_dashboard.json()["declined"][0]["decline_reason"], "Doctor unavailable")
+        alternatives = self.client.post("/api/ai/chat", headers=patient_two, json={"query": "Find an alternative after my declined request"})
+        self.assertEqual(alternatives.status_code, 200)
+        self.assertIn("09:30 am", alternatives.json()["message"])
+
+        replacement = self.client.post("/api/appointments/", headers=patient_three, params={
+            "patient_id": 0,
+            "doctor_id": first_doctor_id,
+            "appointment_date": target.replace(hour=9, minute=30).isoformat(),
+            "reason": "Alternative request",
+        })
+        self.assertEqual(replacement.status_code, 200)
+        self.assertEqual(replacement.json()["appointment"]["status"], "Pending Doctor Approval")
+        self.assertEqual(self.client.get("/api/appointments/", headers=patient_one).json()[0]["status"], "Scheduled")
 
     def test_role_specific_dashboard_endpoints_enforce_authorization(self):
         db = self.session_factory()
