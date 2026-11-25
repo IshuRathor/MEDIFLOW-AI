@@ -18,31 +18,19 @@ from app.models.availability import DoctorAvailability
 from app.models.doctor import Doctor
 from app.models.finance import Bill, Payment
 from app.models.patient import Patient
-from app.services.triage_service import triage_patient
+from app.services.triage_service import emergency_assessment
 from app.services.cancellation import REQUEST_CANCELLATION, cancellation_choices, cancellation_intent
 from app.services.doctor_intelligence import (
     doctor_daily_briefing, doctor_intelligence_call, doctor_patient_timeline, doctor_weekly_workload,
 )
 from app.services.finance_analytics import FINANCE_ROLES, bill_balances, finance_analytics, finance_intent, recorded_total
+from app.services.admin_analytics import admin_analytics, admin_intent
 from app.api.availability import generate_slots
 
 
 MAX_HISTORY_MESSAGES = 20
 MAX_TOOL_CALLS = 6
 DOCTOR_INTELLIGENCE_TOOLS = {"doctor_daily_briefing", "doctor_weekly_workload", "doctor_patient_timeline"}
-EMERGENCY_TERMS = (
-    "severe chest pain",
-    "difficulty breathing",
-    "can't breathe",
-    "cannot breathe",
-    "unconscious",
-    "loss of consciousness",
-    "severe bleeding",
-    "heavy bleeding",
-    "stroke",
-    "seizure",
-    "convulsion",
-)
 logger = logging.getLogger(__name__)
 
 
@@ -688,6 +676,13 @@ def _proposal_create_appointment(db: Session, user, patient_id: int, doctor_id: 
 
 def _build_registry() -> ToolRegistry:
     registry = ToolRegistry()
+    registry.register(
+        "admin_analytics", "Read hospital aggregate reports from existing records. Views: overview, report, demand, appointments, status, cancellations, departments, department_volume, doctor_volume, queues, account_queue, booking_queue, cancellation_queue, limitations.",
+        ("admin",), admin_analytics,
+        {"type": "object", "properties": {
+            "view": {"type": "string"}, "start_date": {"type": "string"}, "end_date": {"type": "string"},
+        }, "required": []},
+    )
     registry.register(
         "finance_analytics", "Read authorized INR finance reports. Views: collections, expenses, categories, balances, performance, month_comparison, quarter_comparison, unusual, forecast.",
         FINANCE_ROLES, finance_analytics,
@@ -1584,10 +1579,10 @@ def run_orchestrator(db: Session, user, query: str, conversation_id: str | None 
     _store_message(db, user.id, conversation_id, "user", query)
 
     lowered = query.lower()
-    is_emergency = any(term in lowered for term in EMERGENCY_TERMS)
+    triage = emergency_assessment(query)
     confirmation = lowered.strip()
     is_confirmation = confirmation in {"yes", "confirm", "book it", "yes please", "please confirm"}
-    if not is_emergency and (is_confirmation or user.role == "patient"):
+    if triage is None and (is_confirmation or user.role == "patient"):
         approvals = db.query(AIApproval).filter(
             AIApproval.conversation_id == conversation_id,
             AIApproval.user_id == user.id,
@@ -1644,8 +1639,7 @@ def run_orchestrator(db: Session, user, query: str, conversation_id: str | None 
             _store_message(db, user.id, conversation_id, "assistant", response["message"])
             return response
 
-    if is_emergency:
-        triage = triage_patient(query)
+    if triage is not None:
         response = {
             "conversation_id": conversation_id,
             "agent": "Medical Triage Agent",
@@ -1707,12 +1701,16 @@ def run_orchestrator(db: Session, user, query: str, conversation_id: str | None 
             doctor_call = ("doctor_patient_timeline", {"patient_id": patient_id})
 
     finance_args = finance_intent(query)
+    explicit_admin_report = re.search(r"\bhospital (?:executive overview|performance report)\b", lowered)
+    admin_args = admin_intent(query) if user.role == "admin" or explicit_admin_report else None
     if user.role == "patient" and finance_args and finance_args["view"] == "balances":
         # Keep patient billing requests on the existing own-account path.
         finance_args = None
     first_response = None
     if doctor_call:
         function_calls = [doctor_call]
+    elif admin_args:
+        function_calls = [("admin_analytics", admin_args)]
     elif finance_args:
         function_calls = [("finance_analytics", finance_args)]
     else:
@@ -1995,13 +1993,16 @@ def run_orchestrator(db: Session, user, query: str, conversation_id: str | None 
 
         result, tool_trace = REGISTRY.execute(name, user, db, arguments)
         trace.append(tool_trace)
-        if name == "finance_analytics":
+        if name in ("finance_analytics", "admin_analytics"):
+            is_admin_report = name == "admin_analytics"
+            report_key = "admin_report" if is_admin_report else "finance_report"
+            view_key = "admin_view" if is_admin_report else "finance_view"
             data = {}
-            if "finance_report" in result:
-                data = {"finance_report": result["finance_report"], "finance_view": arguments}
+            if report_key in result:
+                data = {report_key: result[report_key], view_key: arguments}
             response = {
                 "conversation_id": conversation_id,
-                "agent": "Finance Agent",
+                "agent": "Admin AI Agent" if is_admin_report else "Finance Agent",
                 "status": "error" if result["status"] == "error" else "completed",
                 "message": result["message"],
                 "data": data,

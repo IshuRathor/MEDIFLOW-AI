@@ -5,11 +5,12 @@
 button { font: inherit; }
 .app-shell { display: flex; min-height: 100vh; background: var(--paper); color: var(--ink); }
 .sidebar { width: 250px; flex: 0 0 250px; min-height: 100vh; padding: 31px 20px 20px; background: #e8e5de; display: flex; flex-direction: column; }
-.brand-lockup, .user-chip, .system-status { display: flex; align-items: center; gap: 11px; }
+.user-chip, .system-status { display: flex; align-items: center; gap: 11px; }
 .brand-lockup { padding: 0 11px 42px; }
-.brand-mark { width: 29px; height: 29px; display: grid; place-items: center; background: var(--ink); color: var(--lime); font-family: 'Space Grotesk', sans-serif; font-weight: 700; font-size: 15px; border-radius: 50%; }
-.brand-lockup strong, .user-chip strong, .system-status strong { display: block; font-size: 13px; letter-spacing: -.02em; }
-.brand-lockup span, .user-chip span, .system-status span { display: block; color: #77736d; font-size: 10px; margin-top: 2px; }
+.mediflow-logo { display: block; width: min(190px, 100%); height: auto; }
+.auth-brand .mediflow-logo { width: min(clamp(190px, 50vw, 260px), 100%); }
+.user-chip strong, .system-status strong { display: block; font-size: 13px; letter-spacing: -.02em; }
+.user-chip span, .system-status span { display: block; color: #77736d; font-size: 10px; margin-top: 2px; }
 .sidebar-section-label, .eyebrow, .ai-kicker { font-family: 'DM Mono', monospace; text-transform: uppercase; letter-spacing: .11em; font-size: 10px; color: #8b877f; }
 .sidebar-section-label { padding: 0 12px 12px; }
 .main-nav { display: grid; gap: 3px; }
@@ -59,6 +60,15 @@ button { font: inherit; }
 .triage-result p { margin: 4px 0; line-height: 1.5; font-size: 13px; }
 .triage-result small { color: var(--muted); line-height: 1.4; }
 .triage-result .dark-button { justify-self: start; }
+.triage-result .triage-emergency-guidance { border-inline-start: 3px solid var(--coral); padding: 12px; font-size: 15px; font-weight: 700; }
+.triage-modal.patient-triage-modal { width: min(640px, 100%); max-height: calc(100dvh - 40px); overflow-y: auto; }
+.patient-triage-modal > .capacity-panel { margin-top: 16px; }
+.triage-recommendations { margin-block: 12px; }
+.triage-recommendations h3 { margin: 0 0 8px; font-size: 16px; }
+.triage-recommendations ul { list-style: none; padding: 0; margin: 0 0 12px; border-top: 1px solid var(--line); }
+.triage-doctor { display: flex; align-items: flex-start; justify-content: space-between; flex-wrap: wrap; gap: 10px 18px; padding-block: 14px; border-bottom: 1px solid var(--line); overflow-wrap: anywhere; }
+.triage-doctor > div { flex: 1 1 240px; min-width: 0; }
+.triage-doctor h4 { margin: 0 0 6px; font-size: 15px; }
 .resource-panel { min-height: 420px; }
 .resource-list { display: grid; margin-top: 24px; }
 .resource-row { display: grid; grid-template-columns: 38px minmax(180px, 1fr) minmax(120px, .7fr) minmax(150px, .8fr); gap: 16px; align-items: center; padding: 15px 0; border-top: 1px solid var(--line); font-size: 12px; }
@@ -189,3 +199,215 @@ button { font: inherit; }
   .chat-booking-picker { padding: 9px; }
   .calendar-day, .calendar-day-spacer { min-height: 25px; }
 }
+
+/* Workspace layout */
+.app-shell {
+  --workspace-gap: clamp(16px, 2vw, 26px);
+  --panel-inset: clamp(16px, 2vw, 24px);
+  --row-gap: 12px;
+}
+.dashboard-stack { display: grid; gap: var(--workspace-gap); }
+.dashboard-stack > *, .dashboard-grid > *, .bottom-grid > * { min-width: 0; }
+.dashboard-stack > article:empty { position: absolute; }
+.dashboard-stack .dashboard-grid, .dashboard-stack .bottom-grid, .dashboard-stack .metrics-grid {
+  gap: var(--workspace-gap);
+  margin: 0;
+}
+.dashboard-stack .bottom-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+.dashboard-stack .metrics-grid { grid-template-columns: repeat(4, minmax(0, 1fr)); }
+.dashboard-stack .role-secondary-metrics:not(:has(> :nth-child(4))) {
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+}
+.metric-card { min-width: 0; min-height: 132px; padding: var(--panel-inset); container-type: inline-size; }
+.metric-label { line-height: 1.5; font-size: 11px; }
+.metric-card > strong {
+  margin-top: 16px;
+  font-size: clamp(23px, 2.65vw, 36px);
+  line-height: 1.1;
+  overflow-wrap: anywhere;
+}
+.metric-card > .metric-money {
+  font-size: clamp(12px, calc(148cqi / var(--metric-length)), 36px);
+}
+.content-wrap { padding-inline: clamp(18px, 3vw, 48px); }
+.welcome-row { margin-bottom: var(--workspace-gap); }
+.subhead { line-height: 1.55; }
+.topbar { height: auto; min-height: 72px; padding-block: 10px; gap: 10px 18px; flex-wrap: wrap; }
+.topbar-actions { flex-wrap: wrap; min-width: 0; gap: 8px; }
+.topbar-actions .icon-button { flex: 0 0 36px; }
+.app-shell :is(button, summary, [tabindex]):focus-visible {
+  outline: 2px solid var(--ink);
+  outline-offset: 3px;
+}
+.app-shell .outline-button { min-height: 36px; height: auto; padding-block: 6px; line-height: 1.3; }
+.app-shell .outline-button:disabled, .app-shell .dark-button:disabled { opacity: .6; cursor: not-allowed; }
+.panel-heading { gap: 12px; flex-wrap: wrap; margin-bottom: 16px; }
+.panel-heading > div { min-width: 0; }
+.panel-heading .eyebrow { margin-bottom: 5px; color: #77736e; }
+.panel-heading h2 { line-height: 1.15; overflow-wrap: anywhere; }
+.appointments-panel, .queue-panel, .capacity-panel, .resource-panel { padding: var(--panel-inset); }
+.resource-panel { min-height: 0; }
+.resource-panel .panel-heading h2, .schedule-page-heading h2 { font-size: clamp(25px, 3vw, 36px); }
+.resource-list { margin-top: 0; }
+.resource-list + small { display: block; margin-top: 10px; }
+.resource-row {
+  grid-template-columns: repeat(auto-fit, minmax(min(100%, 7.5rem), 1fr));
+  gap: var(--row-gap);
+  padding-block: 13px;
+  font-size: 13px;
+  line-height: 1.45;
+}
+.resource-row > * { min-width: 0; overflow-wrap: anywhere; }
+.resource-row > strong { text-align: left; }
+.resource-row span { font-size: 12px; }
+.resource-row :is(.avatar, .queue-icon) { align-self: start; }
+.resource-row:has(> :is(.avatar, .queue-icon)) {
+  grid-template-columns: 30px minmax(0, 1.6fr) repeat(2, minmax(0, 1fr));
+}
+.resource-row > .row-action { grid-column: -2 / -1; justify-self: end; }
+.resource-row .approval-actions { margin-top: 0; }
+.role-actions, .approval-actions { flex-wrap: wrap; align-items: center; }
+.approval-actions .dark-button { margin: 0; min-width: 0; min-height: 36px; gap: 8px; }
+.review-list .resource-row { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+.review-list .resource-row > :is(strong, .approval-actions, form) { grid-column: 1 / -1; }
+.review-list form { margin-top: 0; }
+.transaction-list .resource-row { grid-template-columns: repeat(3, minmax(0, 1fr)); }
+.capacity-copy { line-height: 1.55; }
+.capacity-copy strong { font-size: 14px; }
+.capacity-copy span { max-width: none; font-size: 12px; }
+.conversation-message { min-width: 0; overflow-wrap: anywhere; }
+.chat-modal .conversation-message { max-width: 100%; }
+.chat-modal .conversation-message.user { max-width: 92%; }
+.app-shell .status-pill { display: inline-block; align-self: center; max-width: 100%; white-space: normal; overflow-wrap: anywhere; }
+.dashboard-status {
+  margin: 0;
+  border-radius: 14px;
+  padding: 5px 9px;
+  background: #e9e7e1;
+  color: #5e5a54;
+  font: 11px/1.35 'DM Sans', sans-serif;
+  font-weight: 600;
+}
+.dashboard-status:is([data-status="scheduled"], [data-status="confirmed"]) { background: #e9edf4; color: #455c78; }
+.dashboard-status:is([data-status="completed"], [data-status="paid"]) { background: #e5edc3; color: #4a6412; }
+.dashboard-status:is([data-status="pending doctor approval"], [data-status="pending"], [data-status="partially paid"]) { background: #f1f0e2; color: #5e672d; }
+.dashboard-status:is([data-status="cancelled"], [data-status="declined"], [data-status="failed"]) { background: #ffe0d9; color: #a14739; }
+
+/* Appointment lists adapt to their panel width, including split dashboards. */
+.schedule-section, .schedule-page { min-width: 0; }
+.schedule-list { container: schedule / inline-size; }
+.schedule-with-time { --schedule-time: clamp(84px, 13cqi, 130px); }
+.schedule-with-doctor { --schedule-doctor: minmax(0, 1.05fr); }
+.schedule-with-actions { --schedule-actions: minmax(4.8rem, auto); }
+.schedule-columns {
+  display: grid;
+  grid-template-columns: var(--schedule-time,) minmax(0, 1.75fr) var(--schedule-doctor,) minmax(0, .8fr) var(--schedule-actions,);
+  gap: clamp(10px, 1.5vw, 20px);
+  align-items: center;
+  padding-inline: 12px;
+}
+.schedule-labels {
+  padding-block: 10px;
+  background: #e9e7e1;
+  color: #5e5a54;
+  border-radius: 5px 5px 0 0;
+  font: 10px/1.4 'DM Mono', monospace;
+  text-transform: uppercase;
+  letter-spacing: .05em;
+}
+.schedule-list ul { list-style: none; margin: 0; padding: 0; }
+.schedule-entry { min-height: 65px; padding-block: 14px; border-bottom: 1px solid var(--line); }
+.schedule-entry > * { min-width: 0; overflow-wrap: anywhere; }
+.schedule-time { color: #5e5a54; font: 11px/1.5 'DM Mono', monospace; }
+.schedule-person { display: grid; gap: 4px; }
+.schedule-person strong { font-size: 14px; line-height: 1.35; }
+.schedule-person span, .schedule-doctor { color: #5e5a54; font-size: 13px; line-height: 1.45; }
+.schedule-action { justify-self: end; }
+.schedule-action .row-action {
+  min-height: 36px;
+  padding: 5px 10px;
+  border: 1px solid var(--line);
+  border-radius: 18px;
+  font-size: 12px;
+}
+.schedule-action .row-action:hover { background: #ffe0d9; }
+@container schedule (max-width: 530px) {
+  .schedule-labels { display: none; }
+  .schedule-list ul { border-top: 1px solid var(--line); }
+  .schedule-entry { display: flex; flex-wrap: wrap; gap: 8px 12px; padding-inline: 4px; }
+  .schedule-person { flex: 1 0 100%; }
+  .schedule-time { flex: 1 1 8rem; }
+  .schedule-doctor { flex: 1 1 8rem; }
+  .schedule-status { flex: 0 1 auto; }
+  .schedule-action { margin-left: auto; }
+  .schedule-action:empty { display: none; }
+}
+@media (max-width: 980px) {
+  .dashboard-stack .bottom-grid, .dashboard-stack .dashboard-grid { grid-template-columns: minmax(0, 1fr); }
+  .dashboard-stack .metrics-grid, .dashboard-stack .role-secondary-metrics:not(:has(> :nth-child(4))) {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+}
+@media (max-width: 680px) {
+  .sidebar .main-nav { flex-wrap: wrap; overflow-x: visible; }
+  .sidebar .user-chip { display: flex; margin-top: 10px; }
+  .sidebar .user-chip > div { min-width: 0; overflow-wrap: anywhere; }
+  .topbar { min-height: 58px; padding-inline: 16px; }
+  .topbar-actions { gap: 6px; }
+  .app-shell .metric-card { min-height: 108px; }
+  .metric-card > strong { font-size: clamp(22px, 6.5vw, 29px); }
+  .resource-row:has(> :is(.avatar, .queue-icon)) { grid-template-columns: 30px repeat(2, minmax(0, 1fr)); }
+  .resource-row:has(> :is(.avatar, .queue-icon)) > div:nth-child(2) { grid-column: 2 / -1; }
+  .resource-row > .approval-actions { grid-column: 1 / -1; }
+  .auth-card { padding: clamp(20px, 6vw, 38px); }
+}
+@media (min-width: 681px) {
+  .resource-row:has(> :is(.avatar, .queue-icon)):has(> .row-action) {
+    grid-template-columns: 30px minmax(0, 1.6fr) repeat(2, minmax(0, 1fr)) minmax(4rem, auto);
+  }
+}
+
+/* Billing */
+.billing-workspace { min-width: 0; }
+.billing-metrics { display: grid; grid-template-columns: repeat(auto-fit, minmax(135px, 1fr)); gap: 10px; margin: 0 0 18px; }
+.billing-metrics > div { padding: 10px 12px; border: 1px solid var(--line); border-radius: 5px; min-width: 0; }
+.billing-metrics dt { color: var(--muted); font-size: 12px; }
+.billing-metrics dd { margin: 5px 0 0; font-weight: 700; overflow-wrap: anywhere; }
+.billing-filters, .billing-line { display: flex; flex-wrap: wrap; align-items: end; gap: 12px; }
+.billing-filters > label { flex: 1 1 170px; }
+.billing-line { min-inline-size: 0; border: 1px solid var(--line); padding: 12px; margin: 0; }
+.billing-line label { flex: 1 1 110px; min-width: 0; }
+.billing-line label:first-of-type { flex-basis: 200px; }
+.billing-line output { font-weight: 600; padding: 8px 0; }
+.billing-table { overflow-x: auto; margin-block: 12px; }
+.billing-table table { width: 100%; border-collapse: collapse; text-align: left; font-size: 13px; }
+.billing-table caption { text-align: left; padding: 6px 0; color: var(--muted); }
+.billing-table th, .billing-table td { padding: 10px 8px; border-bottom: 1px solid var(--line); }
+.billing-table td { white-space: nowrap; }
+.billing-table td:nth-child(2) { white-space: normal; min-width: 85px; }
+.billing-table .row-action { text-align: left; overflow-wrap: anywhere; min-width: 120px; }
+.billing-records { list-style: none; margin: 0; padding: 0; }
+.billing-records li { display: flex; justify-content: space-between; flex-wrap: wrap; gap: 8px 14px; padding: 9px 0; border-bottom: 1px solid var(--line); overflow-wrap: anywhere; }
+.billing-dialog { overflow-wrap: anywhere; }
+.billing-dialog .role-actions { margin-top: 12px; }
+.billing-fields { display: grid; gap: 12px; border: 0; padding: 0; margin: 0; min-inline-size: 0; }
+.billing-fields > .outline-button { justify-self: start; }
+
+.staff-booking::backdrop { background: rgba(23, 23, 23, .48); backdrop-filter: blur(4px); }
+.triage-modal.staff-booking { position: fixed; inset: 0; margin: auto; width: min(680px, calc(100% - 32px)); max-height: calc(100dvh - 32px); border: 0; color: var(--ink); }
+.booking-directories { display: grid; grid-template-columns: repeat(auto-fit, minmax(min(100%, 235px), 1fr)); gap: 14px; }
+.booking-directories fieldset { display: grid; align-content: start; gap: 10px; border: 1px solid var(--line); padding: 12px; min-inline-size: 0; }
+.booking-directories fieldset p:empty { display: none; }
+.booking-directories p { margin: 0; font-size: 13px; }
+.booking-autocomplete { position: relative; min-width: 0; display: grid; gap: 6px; }
+.booking-suggestions { position: relative; z-index: 3; border: 1px solid var(--line); border-radius: 5px; background: var(--paper); box-shadow: 0 5px 12px rgb(23 23 23 / 12%); }
+.booking-suggestions p { padding: 9px 10px; }
+.booking-suggestions ul { list-style: none; margin: 0; padding: 0; max-height: min(13rem, 32dvh); overflow-y: auto; }
+.booking-suggestions li { padding: 9px 10px; cursor: pointer; overflow-wrap: anywhere; }
+.booking-suggestions li + li { border-top: 1px solid var(--line); }
+.booking-suggestions li[aria-selected="true"] { font-weight: 700; background: var(--lime); }
+.booking-suggestions li:hover, .booking-suggestions li[data-active="true"] { outline: 2px solid var(--ink); outline-offset: -2px; }
+.booking-review { display: grid; gap: 12px; margin: 0; }
+.booking-review > div { display: grid; grid-template-columns: minmax(100px, 1fr) 2fr; gap: 12px; border-bottom: 1px solid var(--line); padding-bottom: 10px; }
+.booking-review dt { color: var(--muted); }
+.booking-review dd { margin: 0; overflow-wrap: anywhere; }

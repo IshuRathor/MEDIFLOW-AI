@@ -1,4 +1,5 @@
 from fastapi import APIRouter, Depends, HTTPException, status
+from sqlalchemy import text
 from sqlalchemy.orm import Session
 from sqlalchemy.exc import IntegrityError
 
@@ -41,17 +42,26 @@ def register_first_or_public(
     request: PublicRegisterRequest,
     db: Session = Depends(get_db),
 ):
+    selected_role = request.role
+    if selected_role is None:
+        # Serialize the one-time bootstrap, including requests for different emails.
+        dialect = db.get_bind().dialect.name
+        if dialect == "postgresql":
+            db.execute(text("LOCK TABLE users IN SHARE ROW EXCLUSIVE MODE"))
+        elif dialect == "sqlite":
+            db.execute(text("BEGIN IMMEDIATE"))
+
     email = str(request.email).strip().lower()
     if db.query(User).filter(User.email.ilike(email)).first():
         raise HTTPException(status_code=409, detail="Email is already registered")
 
-    existing_users = db.query(User).count()
-    selected_role = request.role
-    if existing_users > 0 and selected_role is None:
+    has_users = db.query(User.id).first() is not None
+    if has_users and selected_role is None:
         raise HTTPException(status_code=400, detail="Select an account role")
-    is_first_admin = existing_users == 0
+    if not has_users and selected_role is not None:
+        raise HTTPException(status_code=409, detail="Account registration opens after initial administrator setup")
 
-    if is_first_admin:
+    if selected_role is None:
         user = User(
             full_name=request.full_name.strip(),
             email=email,

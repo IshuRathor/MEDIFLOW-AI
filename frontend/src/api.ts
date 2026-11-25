@@ -1,4 +1,5 @@
 import type { FinanceReportData } from './FinanceReport.js'
+import type { AdminReportData } from './AdminReport.js'
 
 const API_BASE_URL = import.meta.env.VITE_API_URL ?? 'http://localhost:8000/api'
 
@@ -64,7 +65,7 @@ export type PublicRegistrationInput = {
   phone: string
   password: string
   confirm_password: string
-  role: 'patient' | 'clinician' | 'staff' | 'admin'
+  role: 'patient' | 'clinician' | 'staff'
   specialization?: string
   department?: string
   experience_years?: number
@@ -170,9 +171,46 @@ export type BillRecord = {
   id: number
   patient_id: number
   bill_number: string
-  total_amount: number
+  total_amount: string
+  patient_name: string | null
+  amount_paid: string
+  outstanding: string
   status: 'Pending' | 'Partially Paid' | 'Paid' | 'Cancelled'
   created_at: string
+}
+
+export type BillLine = { description: string; quantity: number; unit_price: string }
+export type BillDetail = BillRecord & {
+  items: (BillLine & { amount: string })[]
+  payments: { amount: string; payment_method: string; payment_status: string; paid_at: string }[]
+}
+export type BillingOverview = {
+  generated: number; billed: number; collected: number; outstanding: number
+  unpaid: number; partial: number; paid: number
+  recent: { reference: string; date: string; amount: number }[]
+}
+export type FinanceReview = { approval_id: string; total_amount: string }
+
+export function getBillPage(token: string, search: string, status: string, offset: number, limit: number) {
+  const query = new URLSearchParams({ search, status, offset: String(offset), limit: String(limit) })
+  return get<BillRecord[]>(`/bills/?${query}`, token)
+}
+
+export function getBillDetail(token: string, billId: number) {
+  return get<BillDetail>(`/bills/${billId}`, token)
+}
+
+export function searchBillingPatients(token: string, search: string) {
+  const query = new URLSearchParams({ search, sort: 'name', order: 'asc' })
+  return get<PatientRecord[]>(`/patients/?${query}`, token)
+}
+
+export function reviewBill(token: string, draft: { patient_id: number; bill_number: string; items: BillLine[] }) {
+  return post<FinanceReview>('/bills/', draft, token)
+}
+
+export function reviewPayment(token: string, draft: { bill_id: number; amount: string; payment_method: string; transaction_reference: string }) {
+  return post<FinanceReview>('/payments/', draft, token)
 }
 
 export type PaymentUpdate = {
@@ -219,6 +257,7 @@ export function getDashboardMetrics(token: string): Promise<DashboardMetrics> {
 
 export type RoleDashboardData = {
   role: 'clinician' | 'patient' | 'staff' | 'admin'
+  billing_overview?: BillingOverview
   [key: string]: unknown
 }
 
@@ -269,8 +308,9 @@ export async function createAppointment(token: string, input: AppointmentInput):
   return result.appointment
 }
 
-export function getPatients(token: string): Promise<PatientRecord[]> {
-  return get<PatientRecord[]>('/patients/', token)
+export function getPatients(token: string, search?: string): Promise<PatientRecord[]> {
+  const query = search === undefined ? '' : '?' + new URLSearchParams({ search, sort: 'name', order: 'asc' })
+  return get<PatientRecord[]>(`/patients/${query}`, token)
 }
 
 export function createPatient(token: string, input: PatientInput): Promise<PatientRecord> {
@@ -281,8 +321,12 @@ export function deletePatient(token: string, patientId: number): Promise<void> {
   return remove(`/patients/${patientId}`, token)
 }
 
-export function getDoctors(token: string): Promise<DoctorRecord[]> {
-  return get<DoctorRecord[]>('/doctors/', token)
+export function getDoctors(token: string, filters?: { search: string; specialization: string; offset?: number; limit?: number }): Promise<DoctorRecord[]> {
+  const query = filters ? '?' + new URLSearchParams({
+    search: filters.search, specialization: filters.specialization, sort: 'name', order: 'asc',
+    offset: String(filters.offset ?? 0), limit: String(filters.limit ?? 50),
+  }) : ''
+  return get<DoctorRecord[]>(`/doctors/${query}`, token)
 }
 
 export type AvailabilityRecord = {
@@ -443,6 +487,17 @@ async function remove(path: string, token: string): Promise<void> {
   }
 }
 
+export type TriageDoctor = {
+  id: number
+  name: string
+  specialization: string
+  department: string | null
+  experience_years: number | null
+  availability: 'available' | 'no_slots' | 'unverified'
+  upcoming_slots: string[]
+  matching_explanation: string
+}
+
 export type TriageResponse = {
   urgency: 'Low' | 'Medium' | 'High' | 'Emergency'
   recommended_department: string
@@ -450,6 +505,8 @@ export type TriageResponse = {
   recommended_action: string
   disclaimer: string
   safety_notice: string
+  recommended_doctors: TriageDoctor[]
+  availability_window_days: number | null
 }
 
 export type ChatResponse = {
@@ -457,7 +514,7 @@ export type ChatResponse = {
   agent: string
   status: 'completed' | 'clarification_required' | 'approval_required' | 'error'
   message: string
-  data: Record<string, unknown> & { finance_report?: FinanceReportData }
+  data: Record<string, unknown> & { finance_report?: FinanceReportData; admin_report?: AdminReportData }
   trace: Array<{ tool: string; status: 'success' | 'error' | 'skipped' | 'approval_required'; duration_ms: number }>
   approval_id: string | null
   [key: string]: unknown

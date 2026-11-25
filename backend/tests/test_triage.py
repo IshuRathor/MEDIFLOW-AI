@@ -4,6 +4,19 @@ from app.services.triage_service import triage_patient
 
 
 class TriageServiceTests(unittest.TestCase):
+    def test_emergency_phrases_take_priority_over_fever(self):
+        for phrase in (
+            "pain in chest", "pain in my chest", "CHEST-PRESSURE", "chest pain",
+            "severe breathing difficulty", "fainted", "loss of consciousness",
+            "sudden facial drooping", "arm weakness", "speech difficulty",
+            "severe uncontrolled bleeding", "bleeding won’t stop", "seizure",
+        ):
+            with self.subTest(phrase=phrase):
+                result = triage_patient(f"High fever and {phrase}")
+                self.assertEqual(result.urgency, "Emergency")
+                self.assertIn("Call local emergency services now", result.recommended_action)
+                self.assertIn("Do not wait", result.recommended_action)
+
     def test_emergency_symptoms_are_escalated(self):
         result = triage_patient("The patient has severe chest pain and difficulty breathing")
 

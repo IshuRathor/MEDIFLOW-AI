@@ -12,6 +12,13 @@ env/
 .env
 .env.*
 !.env.example
+*.pem
+*.key
+*.pfx
+*.p12
+id_rsa
+id_ed25519
+id_ecdsa
 
 # Node
 node_modules/
@@ -61,6 +68,10 @@ htmlcov/
 *.pgdump
 *.backup
 *.sql.gz
+*.sql
 backups/
 .ruff_cache/
 .venv-*/
+
+# Local original of the published frontend/public logo
+/frontend/mediflow-logo.png.png

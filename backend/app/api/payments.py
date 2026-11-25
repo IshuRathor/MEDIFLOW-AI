@@ -1,5 +1,11 @@
 from typing import Literal
 from decimal import Decimal
+from secrets import token_urlsafe
+
+from sqlalchemy.exc import IntegrityError
+
+from app.ai.orchestrator import _create_pending_approval
+from app.services.billing import BILLING_REVIEW_PREFIX, record_payment, review_payment
 
 from fastapi import APIRouter, Depends, HTTPException, Query
 from sqlalchemy.orm import Session
@@ -10,7 +16,7 @@ from app.models.finance import Payment, Bill
 from app.schemas.finance import (
     DeletionResponse,
     PaymentActionResponse,
-    PaymentResponse
+    PaymentResponse, PaymentDraft, FinanceReview
 )
 from app.core.security import get_current_user
 from app.models.patient import Patient
@@ -38,107 +44,35 @@ def get_db():
 
 @router.post(
     "/",
-    response_model=PaymentActionResponse,
+    response_model=PaymentActionResponse | FinanceReview,
     dependencies=[Depends(require_roles("admin", "staff"))]
 )
 def create_payment(
-    bill_id: int,
-    amount: float = Query(..., gt=0),
-    payment_method: Literal["Cash", "Card", "Bank Transfer", "Insurance", "Other"] = Query(...),
+    bill_id: int | None = None,
+    amount: Decimal | None = Query(default=None, gt=0),
+    payment_method: Literal["Cash", "Card", "Bank Transfer", "Insurance", "Other"] | None = None,
     payment_status: Literal["Pending", "Completed", "Failed", "Refunded"] = "Completed",
     transaction_reference: str | None = None,
-    db: Session = Depends(get_db)
+    draft: PaymentDraft | None = None,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
 ):
-    # Check bill exists
-    bill = db.query(Bill).filter(
-        Bill.id == bill_id
-    ).first()
-
-    if not bill:
-        raise HTTPException(
-            status_code=404,
-            detail="Bill not found"
-        )
-
-    if bill.status == "Cancelled":
-        raise HTTPException(
-            status_code=409,
-            detail="Payments cannot be recorded against a cancelled bill"
-        )
-
-    completed_total = sum(
-        (payment.amount for payment in bill.payments if payment.payment_status == "Completed"),
-        Decimal("0")
-    )
-    if payment_status == "Completed" and Decimal(str(amount)) > bill.total_amount - completed_total:
-        raise HTTPException(
-            status_code=409,
-            detail="Payment exceeds the bill's outstanding balance"
-        )
-
-    # Check duplicate transaction reference
-    if transaction_reference:
-        existing_payment = db.query(Payment).filter(
-            Payment.transaction_reference == transaction_reference
-        ).first()
-
-        if existing_payment:
-            raise HTTPException(
-                status_code=400,
-                detail="Transaction reference already exists"
-            )
-
-    # Create payment
-    new_payment = Payment(
-        bill_id=bill_id,
-        amount=amount,
-        payment_method=payment_method,
-        payment_status=payment_status,
-        transaction_reference=transaction_reference
-    )
-
-    db.add(new_payment)
-    db.commit()
-    db.refresh(new_payment)
-
-    # Automatically update bill status
-    if payment_status == "Completed":
-
-        total_paid = (
-            db.query(Payment)
-            .filter(
-                Payment.bill_id == bill_id,
-                Payment.payment_status == "Completed"
-            )
-            .all()
-        )
-
-        paid_amount = sum(
-            float(payment.amount)
-            for payment in total_paid
-        )
-
-        if paid_amount >= float(bill.total_amount):
-            bill.status = "Paid"
-
-        elif paid_amount > 0:
-            bill.status = "Partially Paid"
-
+    if draft is not None:
+        review_payment(db, draft.bill_id, draft.amount, draft.transaction_reference)
+        approval = _create_pending_approval(db, current_user, BILLING_REVIEW_PREFIX + token_urlsafe(18), "record_payment", draft.model_dump(mode="json"))
+        return {"approval_id": approval.id, "total_amount": draft.amount}
+    if bill_id is None or amount is None or payment_method is None:
+        raise HTTPException(422, "Bill, amount and payment method are required")
+    try:
+        bill, payment = record_payment(db, bill_id, amount, payment_method, transaction_reference, payment_status)
         db.commit()
-        db.refresh(bill)
-
+    except IntegrityError as error:
+        db.rollback()
+        raise HTTPException(409, "Payment conflicts with an existing record") from error
     return {
         "message": "Payment created successfully",
-        "payment": {
-            "id": new_payment.id,
-            "bill_id": new_payment.bill_id,
-            "amount": float(new_payment.amount),
-            "payment_method": new_payment.payment_method,
-            "payment_status": new_payment.payment_status,
-            "transaction_reference": new_payment.transaction_reference,
-            "paid_at": new_payment.paid_at
-        },
-        "bill_status": bill.status
+        "payment": PaymentResponse.model_validate(payment, from_attributes=True),
+        "bill_status": bill.status,
     }
 
 
@@ -171,7 +105,7 @@ def get_payments(
             "amount": float(payment.amount),
             "payment_method": payment.payment_method,
             "payment_status": payment.payment_status,
-            "transaction_reference": payment.transaction_reference,
+            "transaction_reference": payment.transaction_reference if current_user.role != "patient" else None,
             "paid_at": payment.paid_at
         }
         for payment in payments
@@ -212,7 +146,7 @@ def get_payment(
         "amount": float(payment.amount),
         "payment_method": payment.payment_method,
         "payment_status": payment.payment_status,
-        "transaction_reference": payment.transaction_reference,
+        "transaction_reference": payment.transaction_reference if current_user.role != "patient" else None,
         "paid_at": payment.paid_at
     }
 

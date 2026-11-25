@@ -6,8 +6,20 @@ class TriageRequest(BaseModel):
     symptoms: str = Field(
         ...,
         min_length=3,
+        max_length=500,
         description="Patient symptoms"
     )
+
+
+class TriageDoctor(BaseModel):
+    id: int
+    name: str
+    specialization: str
+    department: str | None
+    experience_years: int | None
+    availability: Literal["available", "no_slots", "unverified"]
+    upcoming_slots: list[str] = Field(default_factory=list)
+    matching_explanation: str
 
 
 class TriageResponse(BaseModel):
@@ -23,6 +35,8 @@ class TriageResponse(BaseModel):
     symptoms_summary: str
 
     recommended_action: str
+    recommended_doctors: list[TriageDoctor] = Field(default_factory=list)
+    availability_window_days: int | None = None
 
     disclaimer: str = (
         "This is an AI-assisted triage recommendation "

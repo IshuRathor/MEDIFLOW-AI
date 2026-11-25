@@ -81,7 +81,7 @@ def get_doctors(
         query = query.filter(Doctor.name.ilike(f"%{search}%") | Doctor.email.ilike(f"%{search}%"))
     if specialization:
         query = query.filter(Doctor.specialization.ilike(f"%{specialization}%"))
-    query = query.order_by(sort_column.asc() if order == "asc" else sort_column.desc())
+    query = query.order_by(sort_column.asc() if order == "asc" else sort_column.desc(), Doctor.id.asc())
     return query.offset(offset).limit(limit).all()
 
 

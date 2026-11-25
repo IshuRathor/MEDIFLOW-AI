@@ -17,7 +17,7 @@ class PatientResponse(BaseModel):
     age: Optional[int] = None
     gender: Optional[str] = None
     phone: Optional[str] = None
-    email: EmailStr
+    email: EmailStr | None = None
     user_id: int | None = None
     created_at: datetime
 

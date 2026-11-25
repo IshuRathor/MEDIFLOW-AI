@@ -26,7 +26,11 @@ def finance_today():
 
 
 def payment_boundary(db, day):
-    boundary = datetime.combine(day, time.min, IST).astimezone(timezone.utc)
+    return reporting_timestamp(db, datetime.combine(day, time.min, IST))
+
+
+def reporting_timestamp(db, value):
+    boundary = value.astimezone(timezone.utc)
     # SQLite stores application payment timestamps as naive UTC.
     return boundary.replace(tzinfo=None) if db.get_bind().dialect.name == "sqlite" else boundary
 
@@ -61,13 +65,17 @@ def amount_series(db, periods, *, expenses=False):
     return [_money(value) for value in totals[:-1]], totals[-1]
 
 
-def recorded_total(db, start=None, end=None, *, expenses=False):
+def recorded_total(db, start=None, end=None, *, expenses=False, through=None, patient_id=None):
     if expenses:
         query, stamp, amount = db.query(Expense), Expense.expense_date, Expense.amount
     else:
         query, stamp, amount = _payments(db), Payment.paid_at, Payment.amount
+        if patient_id is not None:
+            query = query.join(Bill).filter(Bill.patient_id == patient_id)
         start = payment_boundary(db, start) if start else None
         end = payment_boundary(db, end) if end else None
+        if through is not None:
+            query = query.filter(stamp <= reporting_timestamp(db, through))
     if start:
         query = query.filter(stamp >= start)
     if end:
@@ -75,9 +83,11 @@ def recorded_total(db, start=None, end=None, *, expenses=False):
     return _money(query.with_entities(func.sum(amount)).scalar())
 
 
-def bill_balances(db, cutoff=None):
+def bill_balances(db, cutoff=None, *, patient_id=None):
     payments = _payments(db)
     bills = db.query(Bill).filter(Bill.status != "Cancelled")
+    if patient_id is not None:
+        bills = bills.filter(Bill.patient_id == patient_id)
     if cutoff:
         boundary = payment_boundary(db, cutoff)
         payments = payments.filter(Payment.paid_at < boundary)

@@ -15,6 +15,7 @@ class DoctorCreate(BaseModel):
 
 class DoctorResponse(DoctorCreate):
     id: int
+    email: EmailStr | None = None
     created_at: datetime
 
     class Config:

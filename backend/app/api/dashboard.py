@@ -17,6 +17,7 @@ from app.models.availability import DoctorAvailability
 from app.models.audit import AuditLog
 from app.services.cancellation import PENDING_CANCELLATION
 from app.services.finance_analytics import amount_series, bill_balances, finance_today, recorded_total
+from app.services.billing import billing_overview
 
 
 router = APIRouter(prefix="/dashboard", tags=["Dashboard"])
@@ -237,6 +238,7 @@ def patient_dashboard(db: Session = Depends(get_db), current_user: User = Depend
 
     return {
         "role": "patient",
+        "billing_overview": billing_overview(db, patient_id=patient.id),
         "stats": {
             "total_appointments": len(appointments),
             "upcoming_appointments": len(upcoming),
@@ -287,6 +289,7 @@ def finance_dashboard(db: Session = Depends(get_db), current_user: User = Depend
     recent_payments = db.query(Payment).order_by(Payment.paid_at.desc()).limit(10).all()
     return {
         "role": "staff",
+        "billing_overview": billing_overview(db),
         "stats": {
             "total_revenue": float(recorded_total(db, end=tomorrow)),
             "todays_collections": float(daily),
@@ -341,6 +344,7 @@ def admin_dashboard(db: Session = Depends(get_db), current_user: User = Depends(
 
     return {
         "role": "admin",
+        "billing_overview": billing_overview(db, recent=True),
         "stats": {
             "total_patients": len(patients),
             "total_doctors": len(doctors),

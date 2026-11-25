@@ -1,8 +1,8 @@
-import { useCallback, useEffect, useState, type FormEvent } from 'react'
+import { useCallback, useEffect, useState, type CSSProperties, type FormEvent, type ReactNode } from 'react'
 import './App.css'
+import MediflowLogo from './MediflowLogo'
 import {
   getAppointments,
-  getBills,
   getRoleDashboard,
   createDoctor,
   createPatient,
@@ -10,8 +10,6 @@ import {
   acceptAppointmentRequest,
   declineAppointmentRequest,
   createAppointment,
-  createBill,
-  createPayment,
   chatWithMediflow,
   selectCancellationAppointment,
   decideCancellation,
@@ -38,9 +36,6 @@ import {
   register,
   runTriage,
   type DoctorRecord,
-  type BillRecord,
-  type AppointmentRecord,
-  type PaymentUpdate,
   type ChatResponse,
   type DoctorCancellationRequest,
   type PatientCancellationUpdate,
@@ -49,14 +44,20 @@ import {
   type AvailabilityRecord,
   type AppointmentSlot,
   type PatientRecord,
+  type PublicRegistrationInput,
   type TriageResponse,
+  type TriageDoctor,
   type UserRecord,
 } from './api'
 import DoctorSelectionCards, { patientDoctorOptions, visibleChatTrace, type PatientDoctorOption } from './DoctorSelectionCards.js'
+import TriageResults from './TriageResults.js'
+import BillingWorkspace, { BillingOverviewCards } from './BillingWorkspace'
+import StaffAppointmentBooking from './StaffAppointmentBooking'
 import { restoreConversationState, startNewConversationState } from './aiConversationState.js'
 import ChatCancellation from './ChatCancellation.js'
 import DoctorIntelligence, { doctorPrompts, type DoctorIntelligenceResult } from './DoctorIntelligence.js'
 import FinanceReport, { financePrompts, formatINR } from './FinanceReport.js'
+import AdminReport, { adminPrompts } from './AdminReport.js'
 import { asDateKey, CALENDAR_DAYS, ChatAppointmentPicker, loadAppointmentDateSlots, loadDoctorAppointmentDates } from './chatBookingAvailability.js'
 
 type Appointment = { id: number; time: string; patient: string; detail: string; doctor: string; status: string; accent: string }
@@ -69,7 +70,7 @@ const roleOptions: Array<{ value: UserRecord['role']; label: string; description
 ]
 
 function navItemsForRole(role: UserRecord['role']) {
-  if (role === 'patient') return ['Overview']
+  if (role === 'patient') return ['Overview', 'Billing']
   if (role === 'clinician') return ['Overview', 'Appointments', 'Patients', 'Doctors']
   if (role === 'staff') return ['Overview', 'Appointments', 'Patients', 'Doctors', 'Billing']
   return ['Overview', 'Appointments', 'Patients', 'Doctors', 'Billing', 'Accounts']
@@ -82,7 +83,7 @@ function AuthScreen({ onAuthenticated }: { onAuthenticated: (token: string, user
   const [phone, setPhone] = useState('')
   const [password, setPassword] = useState('')
   const [confirmPassword, setConfirmPassword] = useState('')
-  const [registrationRole, setRegistrationRole] = useState<'patient' | 'clinician' | 'staff' | 'admin'>('patient')
+  const [registrationRole, setRegistrationRole] = useState<PublicRegistrationInput['role']>('patient')
   const [specialization, setSpecialization] = useState('')
   const [department, setDepartment] = useState('')
   const [experienceYears, setExperienceYears] = useState('0')
@@ -134,7 +135,7 @@ function AuthScreen({ onAuthenticated }: { onAuthenticated: (token: string, user
   return (
     <main className="auth-shell">
       <section className="auth-card">
-        <div className="brand-lockup auth-brand"><div className="brand-mark">M</div><div><strong>MediFlow</strong><span>Care operations</span></div></div>
+        <div className="brand-lockup auth-brand"><MediflowLogo /></div>
         <p className="eyebrow">{mode === 'login' ? 'Secure workspace' : 'Patient account'}</p>
         <h1>{mode === 'login' ? 'Welcome back.' : 'Create your account.'}</h1>
         <p className="auth-copy">{mode === 'login' ? 'Choose your workspace, then sign in with your account.' : 'Create an account and submit it for the appropriate approval.'}</p>
@@ -147,7 +148,6 @@ function AuthScreen({ onAuthenticated }: { onAuthenticated: (token: string, user
                   ['patient', 'Patient', 'Appointments, care and bills'],
                   ['clinician', 'Doctor', 'Care team and patient workflow'],
                   ['staff', 'Finance staff', 'Billing and hospital operations'],
-                  ['admin', 'Administrator', 'Full hospital workspace access'],
                 ] as const).map(([value, label, description]) => (
                   <button type="button" className={registrationRole === value ? 'role-option selected' : 'role-option'} key={value} onClick={() => setRegistrationRole(value)}>
                     <strong>{label}</strong><span>{description}</span>
@@ -179,12 +179,69 @@ function AuthScreen({ onAuthenticated }: { onAuthenticated: (token: string, user
   )
 }
 
+type ScheduleEntry = {
+  id: string | number
+  name: string
+  detail?: string
+  time?: string
+  dateTime?: string
+  doctor?: string
+  status: string
+  action?: ReactNode
+}
+
+function StatusBadge({ status }: { status: string }) {
+  return <span className="status-pill dashboard-status" data-status={status.toLowerCase()}>{status}</span>
+}
+
+function scheduleTiming(value: unknown, mode: 'time' | 'date' | 'both' = 'both') {
+  if (typeof value !== 'string') return {}
+  const date = new Date(value)
+  return {
+    dateTime: value,
+    time: mode === 'time'
+      ? date.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })
+      : mode === 'date' ? date.toLocaleDateString() : date.toLocaleString(),
+  }
+}
+
+function ScheduleList({ entries, title, nameLabel, empty }: {
+  entries: ScheduleEntry[]
+  title: string
+  nameLabel: string
+  empty: string
+}) {
+  if (!entries.length) return <p className="dashboard-state">{empty}</p>
+  const hasTime = entries.some((entry) => entry.time)
+  const hasDoctor = entries.some((entry) => entry.doctor)
+  const hasActions = entries.some((entry) => entry.action)
+  const columns = ['schedule-list', hasTime && 'schedule-with-time', hasDoctor && 'schedule-with-doctor', hasActions && 'schedule-with-actions'].filter(Boolean).join(' ')
+
+  return <div className={columns}>
+    <div className="schedule-columns schedule-labels" aria-hidden="true">
+      {hasTime && <span>When</span>}
+      <span>{nameLabel}</span>
+      {hasDoctor && <span>Doctor</span>}
+      <span>Status</span>
+      {hasActions && <span>Action</span>}
+    </div>
+    <ul role="list" aria-label={title}>
+      {entries.map((entry) => <li className="schedule-columns schedule-entry" key={entry.id}>
+        {hasTime && <time className="schedule-time" dateTime={entry.dateTime}>{entry.time}</time>}
+        <div className="schedule-person"><strong>{entry.name}</strong>{entry.detail && <span>{entry.detail}</span>}</div>
+        {hasDoctor && <span className="schedule-doctor">{entry.doctor}</span>}
+        <div className="schedule-status"><StatusBadge status={entry.status} /></div>
+        {hasActions && <div className="schedule-action">{entry.action}</div>}
+      </li>)}
+    </ul>
+  </div>
+}
+
 function ResourcePage({
   activeNav,
   role,
   patients,
   doctors,
-  bills,
   appointments,
   users,
   pendingUsers,
@@ -194,9 +251,7 @@ function ResourcePage({
   onDeletePatient,
   onDeleteDoctor,
   onCancelAppointment,
-  onAddBill,
   onAddAppointment,
-  onPayBill,
   onAddAccount,
   onApproveUser,
   onRejectUser,
@@ -205,7 +260,6 @@ function ResourcePage({
   role: UserRecord['role']
   patients: PatientRecord[]
   doctors: DoctorRecord[]
-  bills: BillRecord[]
   appointments: Appointment[]
   users: UserRecord[]
   pendingUsers: UserRecord[]
@@ -215,15 +269,11 @@ function ResourcePage({
   onDeletePatient: (id: number) => void
   onDeleteDoctor: (id: number) => void
   onCancelAppointment: (id: number) => void
-  onAddBill: () => void
   onAddAppointment: () => void
-  onPayBill: (id: number) => void
   onAddAccount: () => void
   onApproveUser: (id: number) => void
   onRejectUser: (id: number) => void
 }) {
-  const patientById = new Map(patients.map((patient) => [patient.id, patient.name]))
-
   if (loading) return <p className="dashboard-state">Loading {activeNav.toLowerCase()}…</p>
   if (error) return <p className="form-error" role="alert">{error}</p>
 
@@ -241,17 +291,19 @@ function ResourcePage({
     </section>
   }
 
-  if (activeNav === 'Billing') {
-    return <section className="panel resource-panel">
-      <div className="panel-heading"><div><p className="eyebrow">Financial operations</p><h2>Billing</h2></div>{(role === 'admin' || role === 'staff') && <button className="outline-button" type="button" onClick={onAddBill}>+ Add bill</button>}</div>
-      {bills.length === 0 ? <p className="dashboard-state">No bills have been created yet.</p> : <div className="resource-list">{bills.map((bill) => <div className="resource-row" key={bill.id}><div className="queue-icon lime-icon">₹</div><div><strong>{bill.bill_number}</strong><span>{patientById.get(bill.patient_id) ?? `Patient #${bill.patient_id}`}</span></div><strong>{formatINR(bill.total_amount)}</strong><span className={`status-pill ${bill.status.toLowerCase().replaceAll(' ', '-')}`}>{bill.status}</span>{(role === 'admin' || role === 'staff') && bill.status !== 'Paid' && bill.status !== 'Cancelled' && <button className="row-action" type="button" onClick={() => onPayBill(bill.id)}>Record payment</button>}</div>)}</div>}
-    </section>
-  }
-
   if (activeNav === 'Appointments') {
-    return <section className="panel resource-panel">
-      <div className="panel-heading"><div><p className="eyebrow">Live schedule</p><h2>Appointments</h2></div><button className="outline-button" type="button" onClick={onAddAppointment}>+ Add appointment</button></div>
-      {appointments.length === 0 ? <p className="dashboard-state">No appointments have been scheduled yet.</p> : <div className="resource-list">{appointments.map((appointment) => <div className="resource-row appointment-resource-row" key={appointment.id}><time>{appointment.time}</time><div><strong>{appointment.patient}</strong><span>{appointment.detail}</span></div><span>{appointment.doctor}</span><span className={`status-pill ${appointment.status.toLowerCase().replaceAll(' ', '-')}`}>{appointment.status}</span>{appointment.status !== 'Cancelled' && <button className="row-action" type="button" onClick={() => onCancelAppointment(appointment.id)}>Cancel</button>}</div>)}</div>}
+    return <section className="schedule-page">
+      <div className="panel-heading schedule-page-heading"><div><p className="eyebrow">Live schedule</p><h2>Appointments</h2></div>{(role === 'admin' || role === 'staff') && <button className="outline-button" type="button" onClick={onAddAppointment}>+ Add appointment</button>}</div>
+      <ScheduleList title="Appointments" nameLabel="Patient and appointment" empty="No appointments have been scheduled yet."
+        entries={appointments.map((appointment) => ({
+          id: appointment.id,
+          time: appointment.time,
+          name: appointment.patient,
+          detail: appointment.detail,
+          doctor: appointment.doctor,
+          status: appointment.status,
+          action: appointment.status !== 'Cancelled' && <button className="row-action" type="button" onClick={() => onCancelAppointment(appointment.id)}>Cancel</button>,
+        }))} />
     </section>
   }
 
@@ -269,21 +321,15 @@ function ResourcePage({
 function CreateResourceModal({
   resource,
   token,
-  patients,
-  doctors,
-  bills,
   onClose,
   onCreated,
 }: {
-  resource: 'Patients' | 'Doctors' | 'Billing' | 'Appointments' | 'Payment'
+  resource: 'Patients' | 'Doctors'
   token: string
   onClose: () => void
-  patients: PatientRecord[]
-  doctors: DoctorRecord[]
-  bills: BillRecord[]
-  onCreated: (record: PatientRecord | DoctorRecord | BillRecord | AppointmentRecord | PaymentUpdate | undefined) => void
+  onCreated: (record: PatientRecord | DoctorRecord) => void
 }) {
-  const [values, setValues] = useState({ name: '', email: '', age: '', gender: '', phone: '', specialization: '', department: '', experience_years: '0', patient_id: '', doctor_id: '', bill_id: '', bill_number: '', total_amount: '', appointment_date: '', reason: '', payment_method: 'Card' })
+  const [values, setValues] = useState({ name: '', email: '', age: '', gender: '', phone: '', specialization: '', department: '', experience_years: '0' })
   const [error, setError] = useState('')
   const [saving, setSaving] = useState(false)
 
@@ -294,13 +340,7 @@ function CreateResourceModal({
     try {
       const record = resource === 'Patients'
         ? await createPatient(token, { name: values.name.trim(), email: values.email.trim(), age: Number(values.age), gender: values.gender || undefined, phone: values.phone || undefined })
-        : resource === 'Doctors'
-          ? await createDoctor(token, { name: values.name.trim(), email: values.email.trim(), specialization: values.specialization.trim(), department: values.department || undefined, phone: values.phone || undefined, experience_years: Number(values.experience_years) })
-          : resource === 'Billing'
-            ? await createBill(token, Number(values.patient_id), values.bill_number.trim(), Number(values.total_amount))
-            : resource === 'Appointments'
-              ? await createAppointment(token, { patient_id: Number(values.patient_id), doctor_id: Number(values.doctor_id), appointment_date: new Date(values.appointment_date).toISOString(), reason: values.reason || undefined })
-              : await createPayment(token, Number(values.bill_id), Number(values.total_amount), values.payment_method)
+        : await createDoctor(token, { name: values.name.trim(), email: values.email.trim(), specialization: values.specialization.trim(), department: values.department || undefined, phone: values.phone || undefined, experience_years: Number(values.experience_years) })
       onCreated(record)
       onClose()
     } catch (requestError) {
@@ -312,9 +352,9 @@ function CreateResourceModal({
 
   return <div className="modal-backdrop" role="presentation" onClick={onClose}><div className="triage-modal resource-modal" role="dialog" aria-modal="true" aria-labelledby="create-resource-title" onClick={(event) => event.stopPropagation()}>
     <button className="modal-close" type="button" onClick={onClose} aria-label="Close form">×</button>
-    <p className="eyebrow">Care operations</p><h2 id="create-resource-title">{resource === 'Payment' ? 'Record payment' : `Add ${resource === 'Patients' ? 'patient' : resource === 'Doctors' ? 'doctor' : resource === 'Billing' ? 'bill' : 'appointment'}`}</h2>
+    <p className="eyebrow">Care operations</p><h2 id="create-resource-title">{`Add ${resource === 'Patients' ? 'patient' : 'doctor'}`}</h2>
     <form className="resource-form" onSubmit={submit}>
-      {resource === 'Billing' ? <><label>Patient<select required value={values.patient_id} onChange={(event) => setValues({ ...values, patient_id: event.target.value })}><option value="">Select patient</option>{patients.map((patient) => <option value={patient.id} key={patient.id}>{patient.name}</option>)}</select></label><label>Bill number<input required value={values.bill_number} onChange={(event) => setValues({ ...values, bill_number: event.target.value })} /></label><label>Total amount<input required type="number" min="0.01" step="0.01" value={values.total_amount} onChange={(event) => setValues({ ...values, total_amount: event.target.value })} /></label></> : resource === 'Payment' ? <><label>Bill<select required value={values.bill_id} onChange={(event) => setValues({ ...values, bill_id: event.target.value })}><option value="">Select bill</option>{bills.filter((bill) => bill.status !== 'Paid' && bill.status !== 'Cancelled').map((bill) => <option value={bill.id} key={bill.id}>{bill.bill_number} — {formatINR(bill.total_amount)}</option>)}</select></label><label>Amount<input required type="number" min="0.01" step="0.01" value={values.total_amount} onChange={(event) => setValues({ ...values, total_amount: event.target.value })} /></label><label>Payment method<select value={values.payment_method} onChange={(event) => setValues({ ...values, payment_method: event.target.value })}><option>Card</option><option>Cash</option><option>Bank Transfer</option><option>Insurance</option><option>Other</option></select></label></> : resource === 'Appointments' ? <><label>Patient<select required value={values.patient_id} onChange={(event) => setValues({ ...values, patient_id: event.target.value })}><option value="">Select patient</option>{patients.map((patient) => <option value={patient.id} key={patient.id}>{patient.name}</option>)}</select></label><label>Doctor<select required value={values.doctor_id} onChange={(event) => setValues({ ...values, doctor_id: event.target.value })}><option value="">Select doctor</option>{doctors.map((doctor) => <option value={doctor.id} key={doctor.id}>Dr. {doctor.name}</option>)}</select></label><label>Date and time<input required type="datetime-local" value={values.appointment_date} onChange={(event) => setValues({ ...values, appointment_date: event.target.value })} /></label><label>Reason<input value={values.reason} onChange={(event) => setValues({ ...values, reason: event.target.value })} /></label></> : <><label>Name<input required minLength={2} value={values.name} onChange={(event) => setValues({ ...values, name: event.target.value })} /></label><label>Email<input required type="email" value={values.email} onChange={(event) => setValues({ ...values, email: event.target.value })} /></label>{resource === 'Patients' ? <><label>Age<input required type="number" min="0" max="130" value={values.age} onChange={(event) => setValues({ ...values, age: event.target.value })} /></label><label>Gender<input value={values.gender} onChange={(event) => setValues({ ...values, gender: event.target.value })} /></label></> : <><label>Specialization<input required value={values.specialization} onChange={(event) => setValues({ ...values, specialization: event.target.value })} /></label><label>Department<input value={values.department} onChange={(event) => setValues({ ...values, department: event.target.value })} /></label><label>Experience years<input required type="number" min="0" value={values.experience_years} onChange={(event) => setValues({ ...values, experience_years: event.target.value })} /></label></>}<label>Phone<input value={values.phone} onChange={(event) => setValues({ ...values, phone: event.target.value })} /></label></>}
+      <label>Name<input required minLength={2} value={values.name} onChange={(event) => setValues({ ...values, name: event.target.value })} /></label><label>Email<input required type="email" value={values.email} onChange={(event) => setValues({ ...values, email: event.target.value })} /></label>{resource === 'Patients' ? <><label>Age<input required type="number" min="0" max="130" value={values.age} onChange={(event) => setValues({ ...values, age: event.target.value })} /></label><label>Gender<input value={values.gender} onChange={(event) => setValues({ ...values, gender: event.target.value })} /></label></> : <><label>Specialization<input required value={values.specialization} onChange={(event) => setValues({ ...values, specialization: event.target.value })} /></label><label>Department<input value={values.department} onChange={(event) => setValues({ ...values, department: event.target.value })} /></label><label>Experience years<input required type="number" min="0" value={values.experience_years} onChange={(event) => setValues({ ...values, experience_years: event.target.value })} /></label></>}<label>Phone<input value={values.phone} onChange={(event) => setValues({ ...values, phone: event.target.value })} /></label>
       {error && <p className="form-error" role="alert">{error}</p>}
       <button className="dark-button" type="submit" disabled={saving}>{saving ? 'Saving…' : 'Save record'} <span>→</span></button>
     </form>
@@ -438,25 +478,29 @@ function PatientBooking({
   token,
   doctors,
   onBooked,
+  initialDoctorId,
 }: {
   token: string
-  doctors: DoctorRecord[]
+  doctors: Pick<DoctorRecord, 'id' | 'name' | 'specialization'>[]
   onBooked: () => void
+  initialDoctorId?: number
 }) {
-  const [doctorId, setDoctorId] = useState('')
+  const [doctorId, setDoctorId] = useState(initialDoctorId?.toString() ?? '')
   const [targetDate, setTargetDate] = useState('')
   const [slots, setSlots] = useState<AppointmentSlot[]>([])
   const [selectedSlot, setSelectedSlot] = useState('')
   const [message, setMessage] = useState('')
   const [error, setError] = useState('')
   const [booking, setBooking] = useState(false)
+  const [loadingSlots, setLoadingSlots] = useState(false)
   const [reason, setReason] = useState('')
 
   async function loadSlots() {
-    if (!doctorId || !targetDate) return
+    if (!doctorId || !targetDate || loadingSlots) return
+    setLoadingSlots(true)
     setError('')
-    setMessage('')
     setSelectedSlot('')
+    setSlots([])
     try {
       const result = await getAvailableSlots(token, Number(doctorId), targetDate)
       setSlots(result.slots)
@@ -464,6 +508,8 @@ function PatientBooking({
       if (result.slots.length === 0 && result.alternatives.length > 0) setError(`No slots today. Next available dates: ${result.alternatives.join(', ')}`)
     } catch (requestError) {
       setError(requestError instanceof Error ? requestError.message : 'Slots could not be loaded')
+    } finally {
+      setLoadingSlots(false)
     }
   }
 
@@ -493,10 +539,10 @@ function PatientBooking({
 
   return <article className="panel capacity-panel"><div className="panel-heading"><div><p className="eyebrow">Appointments</p><h2>Book appointment</h2></div></div>
     <div className="resource-form">
-      <label>Doctor<select required value={doctorId} onChange={(event) => setDoctorId(event.target.value)}><option value="">Select doctor</option>{doctors.map((doctor) => <option value={doctor.id} key={doctor.id}>Dr. {doctor.name} — {doctor.specialization}</option>)}</select></label>
-      <label>Date<input required type="date" value={targetDate} onChange={(event) => setTargetDate(event.target.value)} /></label>
+      <label>Doctor<select required disabled={loadingSlots || booking} value={doctorId} onChange={(event) => { setDoctorId(event.target.value); setSlots([]); setSelectedSlot('') }}><option value="">Select doctor</option>{doctors.map((doctor) => <option value={doctor.id} key={doctor.id}>Dr. {doctor.name} — {doctor.specialization}</option>)}</select></label>
+      <label>Date<input required type="date" disabled={loadingSlots || booking} value={targetDate} onChange={(event) => { setTargetDate(event.target.value); setSlots([]); setSelectedSlot('') }} /></label>
       <label>Reason for appointment<input value={reason} onChange={(event) => setReason(event.target.value)} placeholder="Optional" /></label>
-      <button className="outline-button" type="button" disabled={!doctorId || !targetDate} onClick={() => void loadSlots()}>View slots</button>
+      <button className="outline-button" type="button" disabled={!doctorId || !targetDate || loadingSlots || booking} onClick={() => { setMessage(''); void loadSlots() }}>{loadingSlots ? 'Checking slots…' : 'View slots'}</button>
       {slots.length > 0 && <div className="slot-grid">{slots.map((slot) => <button type="button" key={slot.start} disabled={slot.status !== 'available'} className={selectedSlot === slot.start ? 'slot-option selected' : 'slot-option'} onClick={() => setSelectedSlot(slot.start)}><strong>{new Date(slot.start).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}</strong><span>{slot.status}</span></button>)}</div>}
       {error && <p className="form-error" role="alert">{error}</p>}
       {message && <p className="auth-message" role="status">{message}</p>}
@@ -505,8 +551,55 @@ function PatientBooking({
   </article>
 }
 
+function PatientTriageModal({ token, onClose, onBooked }: { token: string; onClose: () => void; onBooked: () => void }) {
+  const [symptoms, setSymptoms] = useState('')
+  const [triageResult, setTriageResult] = useState<TriageResponse | null>(null)
+  const [triageBookingDoctor, setTriageBookingDoctor] = useState<TriageDoctor | null>(null)
+  const [triageError, setTriageError] = useState('')
+  const [triageLoading, setTriageLoading] = useState(false)
+
+  async function submitTriage() {
+    if (symptoms.trim().length < 3) {
+      setTriageError('Describe at least three characters of symptoms.')
+      return
+    }
+
+    setTriageLoading(true)
+    setTriageError('')
+    try {
+      setTriageResult(await runTriage(symptoms.trim(), token))
+    } catch (error) {
+      setTriageError(error instanceof Error ? error.message : 'The triage request failed.')
+    } finally {
+      setTriageLoading(false)
+    }
+  }
+
+  return <div className="modal-backdrop" role="presentation" onClick={onClose}>
+    <div className="triage-modal patient-triage-modal" role="dialog" aria-modal="true" aria-labelledby="triage-title" onClick={(event) => event.stopPropagation()}>
+      <button className="modal-close" type="button" onClick={onClose} aria-label="Close triage">×</button>
+      <p className="eyebrow">AI assisted triage</p>
+      <h2 id="triage-title">{triageBookingDoctor ? 'Request an appointment' : triageResult ? 'Triage assessment' : 'What symptoms are you experiencing?'}</h2>
+      {triageBookingDoctor ? <>
+        <button className="outline-button" type="button" onClick={() => setTriageBookingDoctor(null)}>Back to assessment</button>
+        <PatientBooking token={token} doctors={[triageBookingDoctor]} initialDoctorId={triageBookingDoctor.id} onBooked={onBooked} />
+      </> : triageResult ? <TriageResults result={triageResult} onBook={setTriageBookingDoctor} onReset={() => setTriageResult(null)} /> : <>
+        <textarea aria-label="Symptoms" value={symptoms} maxLength={500} onChange={(event) => setSymptoms(event.target.value)} placeholder="Describe symptoms in plain language..." />
+        {triageError && <p className="form-error" role="alert">{triageError}</p>}
+        <div className="modal-footer"><span>{symptoms.length}/500</span><button className="dark-button" type="button" onClick={submitTriage} disabled={triageLoading}>{triageLoading ? 'Assessing…' : 'Run assessment'} <span>→</span></button></div>
+      </>}
+    </div>
+  </div>
+}
+
 function MetricCard({ label, value, tone = 'metric-light' }: { label: string; value: string | number; tone?: string }) {
-  return <article className={`metric-card ${tone}`}><div className="metric-label">{label}</div><strong>{value}</strong></article>
+  const money = typeof value === 'string' && value.includes('₹')
+  return <article className={`metric-card ${tone}`}>
+    <div className="metric-label">{label}</div>
+    <strong className={money ? 'metric-money' : undefined} style={money ? { '--metric-length': String(value).length } as CSSProperties : undefined}>
+      {value}
+    </strong>
+  </article>
 }
 
 function AppointmentRequestsPanel({ requests, token, onUpdated }: { requests: Array<Record<string, unknown>>; token: string; onUpdated: () => void }) {
@@ -527,7 +620,7 @@ function AppointmentRequestsPanel({ requests, token, onUpdated }: { requests: Ar
       setBusyId(null)
     }
   }
-  return <article className="panel queue-panel"><div className="panel-heading"><div><p className="eyebrow">Doctor review</p><h2>Appointment Requests</h2></div></div>{requests.length === 0 ? <p className="dashboard-state">No appointment requests are waiting for review.</p> : <div className="resource-list">{requests.map((item) => <div className="resource-row" key={String(item.id)}><strong>Request #{String(item.id)} · {String(item.patient_name)}</strong><span>{new Date(String(item.appointment_date)).toLocaleString()} · {String(item.department ?? 'Department not assigned')}</span><span>{String(item.reason ?? 'General consultation')}</span><span>Requested {item.created_at ? new Date(String(item.created_at)).toLocaleString() : 'time unavailable'} · {String(item.status)}</span><div className="approval-actions"><button className="dark-button" type="button" disabled={busyId !== null} onClick={() => void decide(Number(item.id), 'accept')}>{busyId === Number(item.id) ? 'Saving…' : 'Accept'}</button><button className="outline-button" type="button" disabled={busyId !== null} onClick={() => void decide(Number(item.id), 'decline')}>Decline</button></div></div>)}</div>}{error && <p className="form-error" role="alert">{error}</p>}</article>
+  return <article className="panel queue-panel"><div className="panel-heading"><div><p className="eyebrow">Doctor review</p><h2>Appointment Requests</h2></div></div>{requests.length === 0 ? <p className="dashboard-state">No appointment requests are waiting for review.</p> : <div className="resource-list review-list">{requests.map((item) => <div className="resource-row" key={String(item.id)}><strong>Request #{String(item.id)} · {String(item.patient_name)}</strong><span>{new Date(String(item.appointment_date)).toLocaleString()} · {String(item.department ?? 'Department not assigned')}</span><span>{String(item.reason ?? 'General consultation')}</span><span>Requested {item.created_at ? new Date(String(item.created_at)).toLocaleString() : 'time unavailable'} · {String(item.status)}</span><div className="approval-actions"><button className="dark-button" type="button" disabled={busyId !== null} onClick={() => void decide(Number(item.id), 'accept')}>{busyId === Number(item.id) ? 'Saving…' : 'Accept'}</button><button className="outline-button" type="button" disabled={busyId !== null} onClick={() => void decide(Number(item.id), 'decline')}>Decline</button></div></div>)}</div>}{error && <p className="form-error" role="alert">{error}</p>}</article>
 }
 
 function CancellationRequestsPanel({ requests, token, onUpdated }: {
@@ -558,7 +651,7 @@ function CancellationRequestsPanel({ requests, token, onUpdated }: {
   return <article className="panel queue-panel">
     <div className="panel-heading"><h2>Cancellation requests</h2></div>
     {requests.length === 0 ? <p className="dashboard-state">No cancellation requests are waiting for review.</p> :
-      <div className="resource-list">{requests.map((request) => <div className="resource-row" key={request.request_id}>
+      <div className="resource-list review-list">{requests.map((request) => <div className="resource-row" key={request.request_id}>
         <strong>{request.patient_name}</strong>
         <span>{new Date(request.appointment_date).toLocaleString()}</span>
         <span>Requested {new Date(request.requested_at).toLocaleString()}</span>
@@ -605,7 +698,7 @@ function RoleDashboard({
   doctors,
   onDashboardRefresh,
   onAskAI,
-  onDoctorPrompt,
+  onInsightPrompt,
 }: {
   data: RoleDashboardData | null
   loading: boolean
@@ -615,7 +708,7 @@ function RoleDashboard({
   doctors: DoctorRecord[]
   onDashboardRefresh: () => void
   onAskAI: () => void
-  onDoctorPrompt: (prompt: string) => void
+  onInsightPrompt: (prompt: string) => void
 }) {
   if (loading) return <p className="dashboard-state">Loading role dashboard…</p>
   if (error) return <p className="form-error" role="alert">{error}</p>
@@ -631,7 +724,7 @@ function RoleDashboard({
       <article className="panel capacity-panel">
         <div className="panel-heading"><h2>Doctor AI</h2></div>
         <div className="ai-prompts" aria-label="Doctor AI suggestions">
-          {doctorPrompts.map((prompt) => <button key={prompt} type="button" onClick={() => onDoctorPrompt(prompt)}>{prompt}</button>)}
+          {doctorPrompts.map((prompt) => <button key={prompt} type="button" onClick={() => onInsightPrompt(prompt)}>{prompt}</button>)}
         </div>
       </article>
       <section className="metrics-grid" aria-label="Doctor metrics">
@@ -639,19 +732,37 @@ function RoleDashboard({
         <MetricCard label="Upcoming appointments" value={stats.upcoming_appointments ?? 0} tone="metric-coral" />
         <MetricCard label="Assigned patients" value={stats.assigned_patients ?? 0} tone="metric-lime" />
         <MetricCard label="Completed consultations" value={stats.completed_consultations ?? 0} />
-        <MetricCard label="Appointment requests" value={stats.pending_requests ?? 0} tone="metric-coral" />
       </section>
       <section className="metrics-grid role-secondary-metrics" aria-label="Doctor status metrics">
+        <MetricCard label="Appointment requests" value={stats.pending_requests ?? 0} tone="metric-coral" />
         <MetricCard label="Pending consultations" value={stats.pending_consultations ?? 0} tone="metric-coral" />
         <MetricCard label="Cancelled appointments" value={stats.cancelled_appointments ?? 0} tone="metric-light" />
       </section>
       <section className="dashboard-grid">
-        <AppointmentRequestsPanel requests={pendingRequests} token={token} onUpdated={onDashboardRefresh} />
-        <CancellationRequestsPanel requests={(data.cancellation_requests ?? []) as DoctorCancellationRequest[]} token={token} onUpdated={onDashboardRefresh} />
-        <article className="panel appointments-panel"><div className="panel-heading"><div><p className="eyebrow">My schedule</p><h2>Today's appointments</h2></div></div>{schedule.length === 0 ? <p className="dashboard-state">No appointments scheduled for today.</p> : <div className="appointment-list">{schedule.map((item) => <div className="appointment-row" key={String(item.id)}><time>{new Date(String(item.appointment_date)).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}</time><div className="appointment-marker lime" /><div className="patient-info"><strong>{String(item.patient_name)}</strong><span>{String(item.reason ?? 'General consultation')}</span></div><span className="status-pill confirmed">{String(item.status)}</span></div>)}</div>}</article>
+        <article className="schedule-section">
+          <div className="panel-heading"><div><p className="eyebrow">My schedule</p><h2>Today's appointments</h2></div></div>
+          <ScheduleList title="Today's appointments" nameLabel="Patient and appointment" empty="No appointments scheduled for today."
+            entries={schedule.map((item) => ({
+              id: String(item.id), ...scheduleTiming(item.appointment_date, 'time'), name: String(item.patient_name),
+              detail: String(item.reason ?? 'General consultation'), status: String(item.status),
+            }))} />
+        </article>
         <article className="panel capacity-panel"><div className="panel-heading"><div><p className="eyebrow">Quick actions</p><h2>Clinical tools</h2></div></div><div className="role-actions"><button className="outline-button" type="button" onClick={() => onNavigate('Patients')}>View patients</button><button className="outline-button" type="button" onClick={() => onNavigate('Appointments')}>View appointments</button></div></article>
       </section>
-      <section className="bottom-grid"><article className="panel queue-panel"><div className="panel-heading"><div><p className="eyebrow">Past appointments</p><h2>Recent patient visits</h2></div></div>{pastAppointments.length === 0 ? <p className="dashboard-state">No past appointments yet.</p> : <div className="resource-list">{pastAppointments.map((item) => <div className="resource-row" key={String(item.id)}><strong>#{String(item.id)} · {String(item.patient_name)}</strong><span>{new Date(String(item.appointment_date)).toLocaleString()}</span><span>{String(item.reason ?? 'General consultation')}</span><span>{String(item.status)}</span></div>)}</div>}</article><article className="panel capacity-panel"><div className="panel-heading"><div><p className="eyebrow">Assigned care</p><h2>My patients</h2></div></div>{patients.length === 0 ? <p className="dashboard-state">No assigned patients yet.</p> : <div className="resource-list">{patients.map((patient) => <div className="resource-row" key={String(patient.id)}><div className="avatar avatar-light">{String(patient.name).slice(0, 2).toUpperCase()}</div><div><strong>{String(patient.name)}</strong><span>{String(patient.email ?? 'Email unavailable')}</span></div></div>)}</div>}</article><DoctorAvailabilityManager token={token} /></section>
+      <section className="bottom-grid" aria-label="Appointment review">
+        <AppointmentRequestsPanel requests={pendingRequests} token={token} onUpdated={onDashboardRefresh} />
+        <CancellationRequestsPanel requests={(data.cancellation_requests ?? []) as DoctorCancellationRequest[]} token={token} onUpdated={onDashboardRefresh} />
+      </section>
+      <article className="schedule-section">
+        <div className="panel-heading"><div><p className="eyebrow">Past appointments</p><h2>Recent patient visits</h2></div></div>
+        <ScheduleList title="Recent patient visits" nameLabel="Patient and appointment" empty="No past appointments yet."
+          entries={pastAppointments.map((item) => ({
+            id: String(item.id), ...scheduleTiming(item.appointment_date),
+            name: `#${String(item.id)} · ${String(item.patient_name)}`,
+            detail: String(item.reason ?? 'General consultation'), status: String(item.status),
+          }))} />
+      </article>
+      <section className="bottom-grid"><article className="panel capacity-panel"><div className="panel-heading"><div><p className="eyebrow">Assigned care</p><h2>My patients</h2></div></div>{patients.length === 0 ? <p className="dashboard-state">No assigned patients yet.</p> : <div className="resource-list">{patients.map((patient) => <div className="resource-row" key={String(patient.id)}><div className="avatar avatar-light">{String(patient.name).slice(0, 2).toUpperCase()}</div><div><strong>{String(patient.name)}</strong><span>{String(patient.email ?? 'Email unavailable')}</span></div></div>)}</div>}</article><DoctorAvailabilityManager token={token} /></section>
     </>
   }
 
@@ -663,17 +774,37 @@ function RoleDashboard({
     const cancelled = (data.cancelled ?? []) as Array<Record<string, unknown>>
     const previous = (data.previous ?? []) as Array<Record<string, unknown>>
     const cancellationUpdates = (data.cancellation_history ?? []) as PatientCancellationUpdate[]
-    const bills = (data.bills ?? []) as Array<Record<string, unknown>>
-    const payments = (data.payments ?? []) as Array<Record<string, unknown>>
     const doctor = data.assigned_doctor as Record<string, unknown> | null
     return <>
       <section className="metrics-grid" aria-label="Patient metrics"><MetricCard label="My upcoming appointments" value={stats.upcoming_appointments ?? 0} tone="metric-dark" /><MetricCard label="Pending requests" value={stats.pending_requests ?? 0} tone="metric-coral" /><MetricCard label="My bills" value={stats.bills ?? 0} tone="metric-lime" /><MetricCard label="Pending payments" value={stats.pending_payments ?? 0} /></section>
       <PatientCancellationHistory updates={cancellationUpdates} />
       <section className="bottom-grid"><article className="panel capacity-panel"><div className="panel-heading"><div><p className="eyebrow">AI appointment agent</p><h2>Find a doctor and request a time</h2></div></div><p className="capacity-copy">Ask in your own words. MediFlow checks the doctor directory and recorded availability, then asks you to review and confirm the request.</p><button className="dark-button" type="button" onClick={onAskAI}>Ask MediFlow AI <span>→</span></button></article><PatientBooking token={token} doctors={doctors} onBooked={onDashboardRefresh} /></section>
-      <section className="dashboard-grid"><article className="panel appointments-panel"><div className="panel-heading"><div><p className="eyebrow">Care journey</p><h2>Upcoming appointments</h2></div></div>{upcoming.length === 0 ? <p className="dashboard-state">No upcoming appointments.</p> : <div className="appointment-list">{upcoming.map((item) => <div className="appointment-row" key={String(item.id)}><time>{new Date(String(item.appointment_date)).toLocaleString()}</time><div className="patient-info"><strong>Dr. {String(item.doctor_name)}</strong><span>{String(item.reason ?? 'General consultation')}</span></div><span className="status-pill confirmed">{String(item.status)}</span></div>)}</div>}</article><article className="panel capacity-panel"><div className="panel-heading"><div><p className="eyebrow">My care</p><h2>Assigned doctor</h2></div></div>{doctor ? <div className="capacity-copy"><strong>Dr. {String(doctor.name)}</strong><span>{String(doctor.specialization)}</span></div> : <p className="dashboard-state">No assigned doctor yet.</p>}<div className="role-actions"><button className="outline-button" type="button" onClick={() => onNavigate('Appointments')}>Book appointment</button><button className="outline-button" type="button" onClick={() => onNavigate('Billing')}>View bills</button></div></article></section>
-      <section className="dashboard-grid"><article className="panel appointments-panel"><div className="panel-heading"><div><p className="eyebrow">Request tracking</p><h2>Pending doctor approval</h2></div><button className="outline-button" type="button" onClick={onDashboardRefresh}>Refresh status</button></div>{pendingRequests.length === 0 ? <p className="dashboard-state">No pending requests.</p> : <div className="resource-list">{pendingRequests.map((item) => <div className="resource-row" key={String(item.id)}><strong>Request #{String(item.id)}</strong><span>Dr. {String(item.doctor_name)} · {new Date(String(item.appointment_date)).toLocaleString()}</span><span>{String(item.reason ?? 'General consultation')}</span><span>Pending Doctor Approval</span></div>)}</div>}</article><article className="panel capacity-panel"><div className="panel-heading"><div><p className="eyebrow">My care</p><h2>Assigned doctor</h2></div></div>{doctor ? <div className="capacity-copy"><strong>Dr. {String(doctor.name)}</strong><span>{String(doctor.specialization)}</span></div> : <p className="dashboard-state">No assigned doctor yet.</p>}<div className="role-actions"><button className="outline-button" type="button" onClick={() => onNavigate('Appointments')}>Book appointment</button><button className="outline-button" type="button" onClick={() => onNavigate('Billing')}>View bills</button></div></article></section>
+      <section className="dashboard-grid"><article className="schedule-section">
+        <div className="panel-heading"><div><p className="eyebrow">Care journey</p><h2>Upcoming appointments</h2></div></div>
+        <ScheduleList title="Upcoming appointments" nameLabel="Doctor and appointment" empty="No upcoming appointments."
+          entries={upcoming.map((item) => ({
+            id: String(item.id), ...scheduleTiming(item.appointment_date), name: `Dr. ${String(item.doctor_name)}`,
+            detail: String(item.reason ?? 'General consultation'), status: String(item.status),
+          }))} />
+      </article><article className="panel capacity-panel"><div className="panel-heading"><div><p className="eyebrow">My care</p><h2>Assigned doctor</h2></div></div>{doctor ? <div className="capacity-copy"><strong>Dr. {String(doctor.name)}</strong><span>{String(doctor.specialization)}</span></div> : <p className="dashboard-state">No assigned doctor yet.</p>}<div className="role-actions"><button className="outline-button" type="button" onClick={() => onNavigate('Appointments')}>Book appointment</button><button className="outline-button" type="button" onClick={() => onNavigate('Billing')}>View bills</button></div></article></section>
+      <section className="schedule-section">
+        <div className="panel-heading"><div><p className="eyebrow">Request tracking</p><h2>Pending doctor approval</h2></div><button className="outline-button" type="button" onClick={onDashboardRefresh}>Refresh status</button></div>
+        <ScheduleList title="Pending doctor approval" nameLabel="Request and doctor" empty="No pending requests."
+          entries={pendingRequests.map((item) => ({
+            id: String(item.id), ...scheduleTiming(item.appointment_date),
+            name: `Request #${String(item.id)} · Dr. ${String(item.doctor_name)}`,
+            detail: String(item.reason ?? 'General consultation'), status: 'Pending Doctor Approval',
+          }))} />
+      </section>
       {(declined.length > 0 || cancelled.length > 0) && <section className="bottom-grid"><article className="panel queue-panel"><div className="panel-heading"><div><p className="eyebrow">Request updates</p><h2>Declined and cancelled</h2></div></div><div className="resource-list">{[...declined, ...cancelled].map((item) => <div className="resource-row" key={String(item.id)}><strong>Request #{String(item.id)} · {String(item.status)}</strong><span>Dr. {String(item.doctor_name)} · {new Date(String(item.appointment_date)).toLocaleString()}</span><span>{String(item.reason ?? 'General consultation')}</span>{Boolean(item.decline_reason) && <span>Reason: {String(item.decline_reason)}</span>}</div>)}</div></article></section>}
-      <section className="bottom-grid"><article className="panel queue-panel"><div className="panel-heading"><div><p className="eyebrow">Personal history</p><h2>Previous appointments</h2></div></div>{previous.length === 0 ? <p className="dashboard-state">No previous appointments.</p> : <div className="resource-list">{previous.map((item) => <div className="resource-row" key={String(item.id)}><strong>{new Date(String(item.appointment_date)).toLocaleDateString()}</strong><span>{String(item.reason ?? 'General consultation')}</span><span>{String(item.status)}</span></div>)}</div>}</article><article className="panel capacity-panel"><div className="panel-heading"><div><p className="eyebrow">Personal finance</p><h2>Recent bills</h2></div></div>{bills.length === 0 ? <p className="dashboard-state">No bills found.</p> : <div className="resource-list">{bills.slice(0, 6).map((bill) => <div className="resource-row" key={String(bill.id)}><strong>{String(bill.bill_number)}</strong><span>{formatINR(Number(bill.total_amount))}</span><span>{String(bill.status)}</span></div>)}</div>}<small>Payment history: {payments.length === 0 ? 'No payments recorded.' : `${payments.length} record(s)`}</small></article></section>
+      <section className="bottom-grid"><article className="schedule-section">
+        <div className="panel-heading"><div><p className="eyebrow">Personal history</p><h2>Previous appointments</h2></div></div>
+        <ScheduleList title="Previous appointments" nameLabel="Appointment" empty="No previous appointments."
+          entries={previous.map((item) => ({
+            id: String(item.id), ...scheduleTiming(item.appointment_date, 'date'),
+            name: String(item.reason ?? 'General consultation'), status: String(item.status),
+          }))} />
+      </article><BillingWorkspace token={token} role="patient" overview={data.billing_overview} recentOnly onRefresh={onDashboardRefresh} /></section>
     </>
   }
 
@@ -683,7 +814,8 @@ function RoleDashboard({
     return <>
       <section className="metrics-grid" aria-label="Finance metrics"><MetricCard label="Total collections" value={formatINR(Number(stats.total_revenue ?? 0))} tone="metric-dark" /><MetricCard label="Today's collections" value={formatINR(Number(stats.todays_collections ?? 0))} tone="metric-lime" /><MetricCard label="Monthly collections" value={formatINR(Number(stats.monthly_revenue ?? 0))} tone="metric-coral" /><MetricCard label="Outstanding bills" value={formatINR(Number(stats.outstanding_bills ?? 0))} /></section>
       <section className="metrics-grid role-secondary-metrics"><MetricCard label="Pending payments" value={stats.pending_payments ?? 0} tone="metric-coral" /><MetricCard label="Bills generated" value={stats.total_bills_generated ?? 0} /><MetricCard label="Completed payments" value={stats.completed_payments ?? 0} tone="metric-lime" /></section>
-      <section className="dashboard-grid"><article className="panel appointments-panel"><div className="panel-heading"><div><p className="eyebrow">Recent activity</p><h2>Transactions</h2></div></div>{transactions.length === 0 ? <p className="dashboard-state">No completed transactions.</p> : <div className="resource-list">{transactions.map((item) => <div className="resource-row" key={String(item.id)}><strong>{formatINR(Number(item.amount))}</strong><span>{String(item.payment_method)}</span><span>{String(item.payment_status)}</span></div>)}</div>}</article><article className="panel capacity-panel"><div className="panel-heading"><div><p className="eyebrow">Quick actions</p><h2>Financial tools</h2></div></div><div className="role-actions"><button className="outline-button" type="button" onClick={() => onNavigate('Billing')}>Create bill</button><button className="outline-button" type="button" onClick={() => onNavigate('Billing')}>Record payment</button></div></article></section>
+      <section className="dashboard-grid"><article className="panel appointments-panel"><div className="panel-heading"><div><p className="eyebrow">Recent activity</p><h2>Transactions</h2></div></div>{transactions.length === 0 ? <p className="dashboard-state">No completed transactions.</p> : <div className="resource-list transaction-list">{transactions.map((item) => <div className="resource-row" key={String(item.id)}><strong>{formatINR(Number(item.amount))}</strong><span>{String(item.payment_method)}</span><StatusBadge status={String(item.payment_status)} /></div>)}</div>}</article><article className="panel capacity-panel"><div className="panel-heading"><div><p className="eyebrow">Quick actions</p><h2>Financial tools</h2></div></div><div className="role-actions"><button className="outline-button" type="button" onClick={() => onNavigate('Billing')}>Create bill</button><button className="outline-button" type="button" onClick={() => onNavigate('Billing')}>Record payment</button></div></article></section>
+      <BillingWorkspace token={token} role="staff" overview={data.billing_overview} onRefresh={onDashboardRefresh} />
     </>
   }
 
@@ -692,9 +824,29 @@ function RoleDashboard({
   const recentAppointments = (data.recent_appointments ?? []) as Array<Record<string, unknown>>
   const activity = (data.recent_activity ?? []) as Array<Record<string, unknown>>
   return <>
+    <article className="panel capacity-panel">
+      <div className="panel-heading"><h2>Admin AI</h2></div>
+      <div className="ai-prompts" aria-label="Admin AI suggestions">
+        {adminPrompts.map((prompt) => <button key={prompt} type="button" onClick={() => onInsightPrompt(prompt)}>{prompt}</button>)}
+      </div>
+    </article>
     <section className="metrics-grid" aria-label="Administrator metrics"><MetricCard label="Total patients" value={stats.total_patients ?? 0} tone="metric-dark" /><MetricCard label="Total doctors" value={stats.total_doctors ?? 0} tone="metric-coral" /><MetricCard label="Total appointments" value={stats.total_appointments ?? 0} tone="metric-lime" /><MetricCard label="Today's appointments" value={stats.todays_appointments ?? 0} /></section>
     <section className="metrics-grid role-secondary-metrics"><MetricCard label="Collections" value={formatINR(Number(stats.revenue ?? 0))} tone="metric-lime" /><MetricCard label="Pending bills" value={stats.pending_bills ?? 0} tone="metric-coral" /><MetricCard label="Pending approvals" value={stats.pending_staff_approvals ?? 0} tone="metric-dark" /><MetricCard label="Hospital occupancy" value={stats.hospital_occupancy === null ? 'Unavailable' : String(stats.hospital_occupancy)} /></section>
-    <section className="dashboard-grid"><article className="panel appointments-panel"><div className="panel-heading"><div><p className="eyebrow">Hospital operations</p><h2>Recent appointments</h2></div></div>{recentAppointments.length === 0 ? <p className="dashboard-state">No appointments recorded.</p> : <div className="resource-list">{recentAppointments.map((item) => <div className="resource-row" key={String(item.id)}><strong>{String(item.patient_name)}</strong><span>{String(item.doctor_name)}</span><span>{String(item.status)}</span></div>)}</div>}</article><article className="panel capacity-panel"><div className="panel-heading"><div><p className="eyebrow">Quick actions</p><h2>Administration</h2></div></div><div className="role-actions"><button className="outline-button" type="button" onClick={() => onNavigate('Accounts')}>Manage staff</button><button className="outline-button" type="button" onClick={() => onNavigate('Patients')}>Manage patients</button><button className="outline-button" type="button" onClick={() => onNavigate('Doctors')}>Manage doctors</button></div></article></section>
+    {data.billing_overview && <section className="panel capacity-panel billing-workspace">
+      <div className="panel-heading"><h2>Billing overview</h2><button className="outline-button" type="button" onClick={() => onNavigate('Billing')}>View bills</button></div>
+      <BillingOverviewCards overview={data.billing_overview} />
+      <h3>Recently issued bills</h3>
+      {data.billing_overview.recent.length ? <ul className="billing-records">{data.billing_overview.recent.map((bill) => <li key={bill.reference}><strong>{bill.reference}</strong><span>{new Date(bill.date).toLocaleDateString()}</span><span>{formatINR(bill.amount)}</span></li>)}</ul> : <p>No bills have been generated yet.</p>}
+    </section>}
+    <section className="dashboard-grid"><article className="schedule-section">
+        <div className="panel-heading"><div><p className="eyebrow">Hospital operations</p><h2>Recent appointments</h2></div></div>
+        <ScheduleList title="Recent appointments" nameLabel="Patient and appointment" empty="No appointments recorded."
+          entries={recentAppointments.map((item) => ({
+            id: String(item.id), ...scheduleTiming(item.appointment_date), name: String(item.patient_name),
+            detail: typeof item.reason === 'string' ? item.reason : undefined,
+            doctor: String(item.doctor_name), status: String(item.status),
+          }))} />
+      </article><article className="panel capacity-panel"><div className="panel-heading"><div><p className="eyebrow">Quick actions</p><h2>Administration</h2></div></div><div className="role-actions"><button className="outline-button" type="button" onClick={() => onNavigate('Accounts')}>Manage staff</button><button className="outline-button" type="button" onClick={() => onNavigate('Patients')}>Manage patients</button><button className="outline-button" type="button" onClick={() => onNavigate('Doctors')}>Manage doctors</button></div></article></section>
     <section className="bottom-grid"><article className="panel queue-panel"><div className="panel-heading"><div><p className="eyebrow">Departments</p><h2>Doctor statistics</h2></div></div>{departments.length === 0 ? <p className="dashboard-state">No department data available.</p> : <div className="resource-list">{departments.map((item) => <div className="resource-row" key={String(item.department)}><strong>{String(item.department)}</strong><span>{String(item.doctor_count)} doctors</span></div>)}</div>}</article><article className="panel capacity-panel"><div className="panel-heading"><div><p className="eyebrow">Audit trail</p><h2>Recent activity</h2></div></div>{activity.length === 0 ? <p className="dashboard-state">No recent activity.</p> : <div className="resource-list">{activity.map((item) => <div className="resource-row" key={String(item.id)}><strong>{String(item.action)}</strong><span>{String(item.resource)}</span></div>)}</div>}</article></section>
   </>
 }
@@ -702,10 +854,6 @@ function RoleDashboard({
 function App() {
   const [activeNav, setActiveNav] = useState('Overview')
   const [triageOpen, setTriageOpen] = useState(false)
-  const [symptoms, setSymptoms] = useState('')
-  const [triageResult, setTriageResult] = useState<TriageResponse | null>(null)
-  const [triageError, setTriageError] = useState('')
-  const [triageLoading, setTriageLoading] = useState(false)
   const [chatOpen, setChatOpen] = useState(false)
   const [chatQuery, setChatQuery] = useState('')
   const [chatResponse, setChatResponse] = useState<ChatResponse | null>(null)
@@ -734,10 +882,10 @@ function App() {
   const [appointments, setAppointments] = useState<Appointment[]>([])
   const [patients, setPatients] = useState<PatientRecord[]>([])
   const [doctors, setDoctors] = useState<DoctorRecord[]>([])
-  const [bills, setBills] = useState<BillRecord[]>([])
   const [dataLoading, setDataLoading] = useState(Boolean(token))
   const [dataError, setDataError] = useState('')
-  const [createResource, setCreateResource] = useState<'Patients' | 'Doctors' | 'Billing' | 'Appointments' | 'Payment' | null>(null)
+  const [createResource, setCreateResource] = useState<'Patients' | 'Doctors' | null>(null)
+  const [staffBookingOpen, setStaffBookingOpen] = useState(false)
   const [currentTime] = useState(() => new Date())
   const [roleDashboard, setRoleDashboard] = useState<RoleDashboardData | null>(null)
   const [users, setUsers] = useState<UserRecord[]>([])
@@ -839,33 +987,25 @@ function App() {
         const appointmentRecords = await getAppointments(token)
         let patientRecords: PatientRecord[] = []
         let doctorRecords: DoctorRecord[] = []
-        let billRecords: BillRecord[] = []
 
         if (role === 'admin') {
-          ;[patientRecords, doctorRecords, billRecords] = await Promise.all([
+          ;[patientRecords, doctorRecords] = await Promise.all([
             getPatients(token),
             getDoctors(token),
-            getBills(token),
           ])
           setUsers(await getUsers(token))
           setPendingUsers(await getPendingUsers(token))
-        } else if (role === 'clinician') {
+        } else if (role === 'clinician' || role === 'staff') {
           ;[patientRecords, doctorRecords] = await Promise.all([
             getPatients(token),
             getDoctors(token),
           ])
         } else if (role === 'patient') {
-          ;[billRecords, doctorRecords] = await Promise.all([
-            getBills(token),
-            getDoctors(token),
-          ])
-        } else {
-          billRecords = await getBills(token)
+          doctorRecords = await getDoctors(token)
         }
 
         setPatients(patientRecords)
         setDoctors(doctorRecords)
-        setBills(billRecords)
 
         const patientById = new Map<number, PatientRecord>(patientRecords.map((patient) => [patient.id, patient]))
         const doctorById = new Map<number, DoctorRecord>(doctorRecords.map((doctor) => [doctor.id, doctor]))
@@ -977,26 +1117,9 @@ function App() {
     }} />
   }
 
-  async function submitTriage() {
-    if (symptoms.trim().length < 3) {
-      setTriageError('Describe at least three characters of symptoms.')
-      return
-    }
-
-    if (!token) {
-      setTriageError('Sign in to the backend before running an assessment.')
-      return
-    }
-
-    setTriageLoading(true)
-    setTriageError('')
-    try {
-      setTriageResult(await runTriage(symptoms.trim(), token))
-    } catch (error) {
-      setTriageError(error instanceof Error ? error.message : 'The triage request failed.')
-    } finally {
-      setTriageLoading(false)
-    }
+  function refreshRoleDashboard() {
+    if (!currentUser) return
+    void getRoleDashboard(token, currentUser.role).then(setRoleDashboard).catch((error) => setDataError(error instanceof Error ? error.message : 'Dashboard could not be refreshed'))
   }
 
   async function askChat(text: string, doctorPatientId?: number) {
@@ -1158,6 +1281,7 @@ function App() {
 
   const dashboardRole = currentUser?.role ?? 'admin'
   const chatDoctors = chatResponse ? patientDoctorOptions(chatResponse.data) : []
+  const chatEmergency = chatResponse?.data.urgency === 'Emergency'
   const chatTraceLabel = chatResponse ? visibleChatTrace(currentUser?.role, chatResponse.trace) : null
   const latestAssistantMessageIndex = chatMessages.reduce((latest, message, index) => message.role === 'assistant' ? index : latest, -1)
   const dashboardCopy = {
@@ -1176,22 +1300,22 @@ function App() {
         const navItems = navItemsForRole(role)
         return <>
       <aside className="sidebar">
-        <div className="brand-lockup"><div className="brand-mark">M</div><div><strong>MediFlow</strong><span>Care operations</span></div></div>
+        <div className="brand-lockup"><MediflowLogo /></div>
         <div className="sidebar-section-label">Workspace</div>
         <nav className="main-nav" aria-label="Main navigation">
           {navItems.map((item, index) => <button className={activeNav === item ? 'nav-item active' : 'nav-item'} key={item} onClick={() => setActiveNav(item)} type="button"><span className="nav-number">0{index + 1}</span>{item}</button>)}
         </nav>
         <div className="sidebar-spacer" />
         <div className="system-status"><span className="status-dot" /><div><strong>Workspace connected</strong><span>API session active</span></div></div>
-      <div className="user-chip"><div className="avatar avatar-dark">{(currentUser?.full_name ?? 'AR').slice(0, 2).toUpperCase()}</div><div><strong>{currentUser?.full_name ?? 'Hospital user'}</strong><span>{currentUser?.role ?? 'Administrator'}</span></div><button type="button" className="more-button" aria-label="Sign out" onClick={() => { localStorage.removeItem('mediflow_access_token'); setToken(''); setCurrentUser(null); setConversationId(undefined); setChatResponse(null); setChatMessages([]); setSelectedChatDoctor(null); setSelectedChatDate(''); setSelectedChatTime(''); setChatAvailabilityDates([]); setChatDateSlots([]); setFreshConversation(false) }}>↗</button></div>
+      <div className="user-chip"><div className="avatar avatar-dark">{(currentUser?.full_name ?? 'AR').slice(0, 2).toUpperCase()}</div><div><strong>{currentUser?.full_name ?? 'Hospital user'}</strong><span>{currentUser?.role ?? 'Administrator'}</span></div><button type="button" className="more-button" aria-label="Sign out" onClick={() => { localStorage.removeItem('mediflow_access_token'); setToken(''); setCurrentUser(null); setRoleDashboard(null); setActiveNav('Overview'); setStaffBookingOpen(false); setTriageOpen(false); setConversationId(undefined); setChatResponse(null); setChatMessages([]); setSelectedChatDoctor(null); setSelectedChatDate(''); setSelectedChatTime(''); setChatAvailabilityDates([]); setChatDateSlots([]); setFreshConversation(false) }}>↗</button></div>
       </aside>
 
       <main className="main-content">
-        <header className="topbar"><div className="breadcrumb"><span>Workspace</span><b>/</b>{activeNav}</div><div className="topbar-actions"><button className="icon-button" type="button" aria-label="Search">⌕</button><button className="icon-button notification" type="button" aria-label="Notifications">◌<span /></button>{currentUser?.role === 'admin' && <button className="outline-button" type="button" onClick={() => setAccountModalOpen(true)}>+ Create account</button>}<button className="outline-button" type="button" onClick={openAIChat}>Ask MediFlow</button><button className="outline-button" type="button" onClick={() => setTriageOpen(true)}>+ New triage</button></div></header>
+        <header className="topbar"><div className="breadcrumb"><span>Workspace</span><b>/</b>{activeNav}</div><div className="topbar-actions"><button className="icon-button" type="button" aria-label="Search">⌕</button><button className="icon-button notification" type="button" aria-label="Notifications">◌<span /></button>{currentUser?.role === 'admin' && <button className="outline-button" type="button" onClick={() => setAccountModalOpen(true)}>+ Create account</button>}<button className="outline-button" type="button" onClick={openAIChat}>Ask MediFlow</button>{currentUser?.role === 'patient' && <button className="outline-button" type="button" onClick={() => setTriageOpen(true)}>+ New triage</button>}</div></header>
         <div className="content-wrap">
-          {activeNav !== 'Overview' ? <ResourcePage activeNav={activeNav} role={currentUser?.role ?? 'clinician'} patients={patients} doctors={doctors} bills={bills} appointments={appointments} users={users} pendingUsers={pendingUsers} loading={dataLoading} error={dataError} onAdd={() => { if (activeNav === 'Patients' || activeNav === 'Doctors') setCreateResource(activeNav) }} onAddBill={() => setCreateResource('Billing')} onAddAppointment={() => setCreateResource('Appointments')} onAddAccount={() => setAccountModalOpen(true)} onApproveUser={(id) => { void runMutation(async () => { await approveUser(token, id); setPendingUsers((current) => current.filter((user) => user.id !== id)); setUsers(await getUsers(token)) }) }} onRejectUser={(id) => { void runMutation(async () => { await rejectUser(token, id); setPendingUsers((current) => current.filter((user) => user.id !== id)); setUsers(await getUsers(token)) }) }} onPayBill={(_id) => setCreateResource('Payment')} onDeletePatient={(id) => { if (!window.confirm('Delete this patient?')) return; void runMutation(async () => { await deletePatient(token, id); setPatients((current) => current.filter((patient) => patient.id !== id)) }) }} onDeleteDoctor={(id) => { if (!window.confirm('Delete this doctor?')) return; void runMutation(async () => { await deleteDoctor(token, id); setDoctors((current) => current.filter((doctor) => doctor.id !== id)) }) }} onCancelAppointment={(id) => { if (!window.confirm('Cancel this appointment?')) return; void runMutation(async () => { await cancelAppointment(token, id); setAppointments((current) => current.map((appointment) => appointment.id === id ? { ...appointment, status: 'Cancelled' } : appointment)) }) }} /> : <>
+          {activeNav === 'Billing' && currentUser && currentUser.role !== 'clinician' ? <BillingWorkspace token={token} role={currentUser.role} overview={roleDashboard?.billing_overview} onRefresh={refreshRoleDashboard} /> : activeNav !== 'Overview' ? <ResourcePage activeNav={activeNav} role={currentUser?.role ?? 'clinician'} patients={patients} doctors={doctors} appointments={appointments} users={users} pendingUsers={pendingUsers} loading={dataLoading} error={dataError} onAdd={() => { if (activeNav === 'Patients' || activeNav === 'Doctors') setCreateResource(activeNav) }} onAddAppointment={() => setStaffBookingOpen(true)} onAddAccount={() => setAccountModalOpen(true)} onApproveUser={(id) => { void runMutation(async () => { await approveUser(token, id); setPendingUsers((current) => current.filter((user) => user.id !== id)); setUsers(await getUsers(token)) }) }} onRejectUser={(id) => { void runMutation(async () => { await rejectUser(token, id); setPendingUsers((current) => current.filter((user) => user.id !== id)); setUsers(await getUsers(token)) }) }} onDeletePatient={(id) => { if (!window.confirm('Delete this patient?')) return; void runMutation(async () => { await deletePatient(token, id); setPatients((current) => current.filter((patient) => patient.id !== id)) }) }} onDeleteDoctor={(id) => { if (!window.confirm('Delete this doctor?')) return; void runMutation(async () => { await deleteDoctor(token, id); setDoctors((current) => current.filter((doctor) => doctor.id !== id)) }) }} onCancelAppointment={(id) => { if (!window.confirm('Cancel this appointment?')) return; void runMutation(async () => { await cancelAppointment(token, id); setAppointments((current) => current.map((appointment) => appointment.id === id ? { ...appointment, status: 'Cancelled' } : appointment)) }) }} /> : <>
           <section className="welcome-row"><div><p className="eyebrow">{dashboardCopy.label} <span>·</span> {todayLabel} <span>·</span> {timeLabel}</p><h1>{dashboardCopy.title}<span>.</span></h1><p className="subhead">{dashboardCopy.text}</p></div></section>
-          <RoleDashboard
+          <div className="dashboard-stack"><RoleDashboard
             data={roleDashboard}
             loading={dataLoading}
             error={dataError}
@@ -1199,23 +1323,20 @@ function App() {
             token={token}
             doctors={doctors}
             onAskAI={openAIChat}
-            onDoctorPrompt={(prompt) => { setChatQuery(prompt); openAIChat() }}
-            onDashboardRefresh={() => {
-              if (!currentUser) return
-              void getRoleDashboard(token, currentUser.role).then(setRoleDashboard).catch((requestError) => setDataError(requestError instanceof Error ? requestError.message : 'Dashboard could not be refreshed'))
-            }}
-          />
+            onInsightPrompt={(prompt) => { setChatQuery(prompt); openAIChat() }}
+            onDashboardRefresh={refreshRoleDashboard}
+          /></div>
           </>}
         </div>
       </main>
       </>})()}
 
-      {triageOpen && <div className="modal-backdrop" role="presentation" onClick={() => setTriageOpen(false)}><div className="triage-modal" role="dialog" aria-modal="true" aria-labelledby="triage-title" onClick={(event) => event.stopPropagation()}><button className="modal-close" type="button" onClick={() => setTriageOpen(false)} aria-label="Close triage">×</button><p className="eyebrow">AI assisted triage</p><h2 id="triage-title">What is the patient feeling?</h2>{triageResult ? <div className="triage-result"><strong>{triageResult.urgency} urgency</strong><span>{triageResult.recommended_department}</span><p>{triageResult.recommended_action}</p><small>{triageResult.safety_notice}</small><small>{triageResult.disclaimer}</small><button className="dark-button" type="button" onClick={() => setTriageResult(null)}>Run another <span>→</span></button></div> : <><textarea value={symptoms} maxLength={500} onChange={(event) => setSymptoms(event.target.value)} placeholder="Describe symptoms in plain language..." />{triageError && <p className="form-error" role="alert">{triageError}</p>}<div className="modal-footer"><span>{symptoms.length}/500</span><button className="dark-button" type="button" onClick={submitTriage} disabled={triageLoading}>{triageLoading ? 'Assessing…' : 'Run assessment'} <span>→</span></button></div></>}</div></div>}
+      {currentUser?.role === 'patient' && triageOpen && <PatientTriageModal token={token} onClose={() => setTriageOpen(false)} onBooked={refreshRoleDashboard} />}
       {chatOpen && <div className="modal-backdrop chat-modal-backdrop" role="presentation" onClick={() => setChatOpen(false)}>
         <div className="triage-modal chat-modal" role="dialog" aria-modal="true" aria-labelledby="chat-title" onClick={(event) => event.stopPropagation()}>
           <button className="modal-close" type="button" onClick={() => setChatOpen(false)} aria-label="Close AI assistant">×</button>
           <header className="chat-modal-header">
-            <p className="eyebrow">Operational assistant</p><h2 id="chat-title">{dashboardRole === 'clinician' ? 'Doctor AI' : dashboardRole === 'staff' ? 'Finance AI' : 'Ask MyDFlow AI.'}</h2>
+            <p className="eyebrow">Operational assistant</p><h2 id="chat-title">{dashboardRole === 'clinician' ? 'Doctor AI' : dashboardRole === 'staff' ? 'Finance AI' : dashboardRole === 'admin' ? 'Admin AI' : 'Ask MyDFlow AI.'}</h2>
             <p className="auth-copy">Ask in natural language to complete authorized hospital operations.</p>
           </header>
           <div className="chat-modal-tools">
@@ -1230,25 +1351,29 @@ function App() {
                   ? doctorPrompts
                   : dashboardRole === 'staff'
                     ? financePrompts
-                    : ['Show hospital overview', 'How many appointments are scheduled today?', 'Show pending staff approvals', 'Show our financial performance trend']
+                    : adminPrompts
               ).map((prompt) => <button type="button" key={prompt} onClick={() => setChatQuery(prompt)}>{prompt}</button>)}
             </div>
           </div>
           {chatRestoreLoading && <p className="dashboard-state">Restoring your latest conversation…</p>}
           <div className="conversation-transcript" aria-live="polite">
+            {currentUser?.role === 'admin' && chatLoading && <AdminReport loading />}
             {chatMessages.map((message, index) => <div className={`conversation-message ${message.role}`} key={`${conversationId ?? 'new'}-${index}`}>
               {message.role === 'assistant' && index === latestAssistantMessageIndex && <strong>{chatResponse?.agent ?? 'MediFlow AI'}</strong>}
-              <p>{message.content}</p>
+              {currentUser?.role === 'admin' && message.role === 'assistant' && index === latestAssistantMessageIndex &&
+                chatResponse?.agent === 'Admin AI Agent' && chatResponse.status === 'error'
+                ? <AdminReport error={message.content} /> : <p>{message.content}</p>}
               {message.role === 'assistant' && index === latestAssistantMessageIndex && chatResponse && <>
                 {(currentUser?.role === 'staff' || currentUser?.role === 'admin') && <FinanceReport report={chatResponse.data.finance_report} />}
+                {currentUser?.role === 'admin' && <AdminReport report={chatResponse.data.admin_report} />}
                 {currentUser?.role === 'clinician' && <DoctorIntelligence
                   result={chatResponse.data.doctor_intelligence as DoctorIntelligenceResult | undefined}
                   disabled={chatLoading || chatRestoreLoading || approvalLoading}
                   onSelect={(id) => void askChat("Show this patient's appointment history", id)}
                 />}
-                <DoctorSelectionCards doctors={chatDoctors} disabled={chatLoading || chatAvailabilityLoading} onSelect={selectChatDoctor} />
-                {selectedChatDoctor && <p className="chat-selection-note">Selected doctor: Dr. {selectedChatDoctor.name}</p>}
-                {currentUser?.role === 'patient' && selectedChatDoctor && <ChatAppointmentPicker
+                {!chatEmergency && <DoctorSelectionCards doctors={chatDoctors} disabled={chatLoading || chatAvailabilityLoading} onSelect={selectChatDoctor} />}
+                {!chatEmergency && selectedChatDoctor && <p className="chat-selection-note">Selected doctor: Dr. {selectedChatDoctor.name}</p>}
+                {!chatEmergency && currentUser?.role === 'patient' && selectedChatDoctor && <ChatAppointmentPicker
                   availabilityDates={chatAvailabilityDates}
                   availabilityLoading={chatAvailabilityLoading}
                   availabilityError={chatAvailabilityError}
@@ -1282,7 +1407,22 @@ function App() {
         </div>
       </div>}
       {accountModalOpen && <CreateAccountModal token={token} patients={patients} onClose={() => setAccountModalOpen(false)} onCreated={(user) => setUsers((current) => [...current, user])} />}
-      {createResource && <CreateResourceModal resource={createResource} token={token} patients={patients} doctors={doctors} bills={bills} onClose={() => setCreateResource(null)} onCreated={(record) => { if (!record) return; if (createResource === 'Patients') setPatients((current) => [...current, record as PatientRecord]); else if (createResource === 'Doctors') setDoctors((current) => [...current, record as DoctorRecord]); else if (createResource === 'Billing') setBills((current) => [...current, record as BillRecord]); else if (createResource === 'Payment') { const update = record as PaymentUpdate; setBills((current) => current.map((bill) => bill.id === update.billId ? { ...bill, status: update.status } : bill)) } else if (createResource === 'Appointments') setAppointments((current) => [...current, { id: (record as AppointmentRecord).id, time: new Date((record as AppointmentRecord).appointment_date).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }), patient: patients.find((patient) => patient.id === (record as AppointmentRecord).patient_id)?.name ?? `Patient #${(record as AppointmentRecord).patient_id}`, detail: (record as AppointmentRecord).reason ?? 'General consultation', doctor: `Doctor #${(record as AppointmentRecord).doctor_id}`, status: 'Confirmed', accent: 'blue' }]) }} />}
+      {staffBookingOpen && (currentUser?.role === 'staff' || currentUser?.role === 'admin') && <StaffAppointmentBooking
+        token={token}
+        onClose={() => setStaffBookingOpen(false)}
+        onBooked={(appointment, patient, doctor) => {
+          setAppointments((current) => [...current, {
+            id: appointment.id, time: new Date(appointment.appointment_date).toLocaleString([], { dateStyle: 'medium', timeStyle: 'short' }),
+            patient: patient.name, detail: appointment.reason ?? doctor.specialization,
+            doctor: doctor.name, status: appointment.status, accent: 'blue',
+          }])
+          refreshRoleDashboard()
+        }}
+      />}
+      {createResource && <CreateResourceModal resource={createResource} token={token} onClose={() => setCreateResource(null)} onCreated={(record) => {
+        if (createResource === 'Patients') setPatients((current) => [...current, record as PatientRecord])
+        else setDoctors((current) => [...current, record as DoctorRecord])
+      }} />}
     </div>
   )
 }

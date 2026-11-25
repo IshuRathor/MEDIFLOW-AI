@@ -8,9 +8,11 @@ MEDIFLOW AI is a role-based hospital operations platform built with FastAPI, Pos
 - JWT authentication and role-based authorization
 - Patient and doctor ownership restrictions
 - Slot-based patient booking and cancellation requests with doctor review
+- Staff and Admin appointment booking with live patient, doctor and specialty search
 - Doctor briefings, weekly workload and assigned-patient appointment timelines
-- Billing, payments, INR finance reports and interactive charts
-- AI-assisted triage, hospital operations and support
+- Itemized billing, payment recording, patient bill history, and interactive INR finance reports
+- Admin executive reports, operational analytics, and charts
+- Patient-only triage with emergency-first guidance and registered doctor recommendations
 - Database-backed conversation history and expiring approval records
 - Deterministic fallback routing when Gemini is unavailable
 
@@ -33,9 +35,9 @@ One authenticated orchestrator and ToolRegistry serve all four workspaces. The b
 | Patient AI | `patient` | Doctor and slot selection, booking and cancellation requests, own appointment and billing history |
 | Doctor AI | `clinician` | Daily briefing, pending queues, calendar-week workload and appointments for assigned patients |
 | Finance AI | `staff` | Collections, expenses, balances, month and quarter comparisons, interactive INR charts, unusual expense candidates and a conditional baseline forecast |
-| Admin AI | `admin` | Existing administrative workspace with account approval, operational dashboard and authorized shared AI tools, including Finance reports |
+| Admin AI | `admin` | Executive overview, appointment trends, department and doctor counts, queue ages, and access to shared Finance reports |
 
-Finance reports use recorded data in IST. Forecasts require six completed months with positive recorded collections. Expense categories are available from the database. Department expense attribution and a dedicated Admin analytics agent are future work.
+Finance and Admin reports use recorded data in IST. Finance forecasts require six completed months with positive recorded collections. Admin trends use the recorded appointment or request dates and current statuses. Historical capacity, patient wait times, and department expense attribution are unavailable.
 
 ## Project layout
 
@@ -98,7 +100,7 @@ python -m alembic upgrade head
 python -m uvicorn app.main:app --reload --host 127.0.0.1 --port 8000
 ```
 
-In a second PowerShell terminal, install the exact frontend dependencies from the lockfile and start Vite:
+In a second PowerShell terminal, start in the directory containing the `MEDIFLOW-AI` checkout. Install frontend dependencies from the lockfile and start Vite:
 
 ```powershell
 Set-Location MEDIFLOW-AI\frontend
@@ -110,11 +112,31 @@ Open `http://127.0.0.1:5173/`. The API is at `http://127.0.0.1:8000`; interactiv
 
 Use SQLite for each developer's local work. For a shared PostgreSQL environment, install/run PostgreSQL separately and configure each authorized developer's `DATABASE_URL` privately in their own `backend/.env` (for example, `postgresql+psycopg2://user:password@localhost:5432/hospital_management`). Do not share a local SQLite file or commit database files. Shared databases contain shared data, so coordinate before using one.
 
-`GEMINI_API_KEY` is optional; core CRUD and deterministic triage work without it. Without a key, AI chat uses deterministic fallback behavior. `REDIS_URL` is also optional; without Redis, rate limits are process-local.
+For Gemini-assisted chat, create your own Gemini API key and set `GEMINI_API_KEY` in `backend/.env`, then restart the API. Leave it blank to use deterministic chat, triage, and core operations. `REDIS_URL` is also optional. Without Redis, rate limits are process-local.
 
 ## Authentication
 
-Use **Create an account** on the sign-in page. On a fresh database, select **Administrator** for the first account and then sign in as Administrator. The first registration through `POST /api/auth/register` automatically becomes an approved administrator. A fresh install contains no seeded accounts or patients. After the first registration, patients can register and sign in immediately. Doctor, Finance staff, and administrator registrations require review in **Accounts** by an existing administrator.
+On a fresh database, complete initial administrator setup before opening the application to public users. From the trusted setup environment, submit `full_name`, `email`, and `password` to the existing `POST /api/auth/register` endpoint with the `role` field omitted. The role-omitted request creates one approved administrator while the database is empty. Sign in using **Administrator** on the sign-in page.
+
+With the local API running, use a separate PowerShell window. Enter the new administrator's email in the credential prompt's username field.
+
+```powershell
+$adminName = Read-Host 'Administrator full name'
+$adminCredential = Get-Credential -Message 'Enter the new administrator email and password'
+$bootstrapBody = @{
+  full_name = $adminName
+  email     = $adminCredential.UserName
+  password  = $adminCredential.GetNetworkCredential().Password
+} | ConvertTo-Json
+try {
+  Invoke-RestMethod -Method Post -Uri 'http://127.0.0.1:8000/api/auth/register' `
+    -ContentType 'application/json' -Body $bootstrapBody
+} finally {
+  Remove-Variable bootstrapBody, adminCredential
+}
+```
+
+The public **Create an account** form offers Patient, Doctor, and Finance staff registration. Patients can sign in immediately. Doctor and Finance staff accounts require approval in **Accounts** by an existing administrator.
 
 To try the booking workflow, register and approve a doctor, sign in as that doctor to configure availability, then register a patient and request a slot. Use synthetic records in local development. For direct API calls, use `POST /api/auth/login` and send the returned token as `Authorization: Bearer <token>`.
 
@@ -243,6 +265,11 @@ database errors, check the working directory and `DATABASE_URL`, then run
 reach the API, verify the URL includes `/api` and the frontend origin is allowed.
 For Windows activation errors, use the process-scoped execution policy above,
 or invoke `backend\.venv\Scripts\python.exe` directly.
+If signup reports that initial administrator setup is required, complete the
+bootstrap above. If setup reports that an account role is required, sign in
+with the existing Administrator account. For a port conflict, stop the service
+already using the port or update the API URL and CORS settings to match the
+ports you use.
 
 `HOSPITAL_TIMEZONE` controls relative booking dates where named timezone data
 is available. Without it, the backend falls back to the machine's local

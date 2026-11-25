@@ -2,6 +2,7 @@ import { createElement as h, useState } from 'react'
 
 const inr = new Intl.NumberFormat('en-IN', { style: 'currency', currency: 'INR' })
 const axisMoney = new Intl.NumberFormat('en-IN', { style: 'currency', currency: 'INR', notation: 'compact', maximumFractionDigits: 1 })
+const countFormat = new Intl.NumberFormat('en-IN', { maximumFractionDigits: 0 })
 const colors = ['#18716b', '#a54835', '#514f97', '#765b17']
 
 export const financePrompts = [
@@ -24,10 +25,10 @@ export function formatINR(value) {
 function formatMetric(metric) {
   if (metric.value === null) return 'Unavailable'
   if (metric.unit === 'INR') return formatINR(metric.value)
-  return metric.unit === 'percent' ? `${metric.value}%` : String(Number(metric.value))
+  return metric.unit === 'percent' ? `${metric.value}%` : countFormat.format(metric.value)
 }
 
-function ChartTable({ chart }) {
+function ChartTable({ chart, formatValue }) {
   return h('div', { className: 'finance-table-scroll' },
     h('table', null,
       h('caption', null, chart.title),
@@ -35,13 +36,13 @@ function ChartTable({ chart }) {
         chart.series.map((series) => h('th', { scope: 'col', key: series.label }, series.label)))),
       h('tbody', null, chart.labels.map((label, index) => h('tr', { key: index },
         h('th', { scope: 'row' }, label),
-        chart.series.map((series) => h('td', { key: series.label }, formatINR(series.values[index]))),
+        chart.series.map((series) => h('td', { key: series.label }, formatValue(series.values[index]))),
       ))),
     ),
   )
 }
 
-function FinanceChart({ chart }) {
+export function ReportChart({ chart }) {
   const [active, setActive] = useState(null)
   const width = 620
   const left = 68
@@ -56,20 +57,23 @@ function FinanceChart({ chart }) {
   const x = (index) => left + (index + 0.5) * rowWidth
   const y = (amount) => bottom - ((amount - minimum) / range) * (bottom - top)
   const advance = Math.max(1, Math.ceil(chart.labels.length / 5))
-  const ticks = [...new Set([minimum, (minimum + maximum) / 2, 0, maximum])].sort((a, b) => a - b)
+  const isCount = chart.unit === 'count'
+  const formatValue = isCount ? (value) => countFormat.format(value) : formatINR
+  const midpoint = (minimum + maximum) / 2
+  const ticks = [...new Set([minimum, isCount ? Math.round(midpoint) : midpoint, 0, maximum])].sort((a, b) => a - b)
   const tooltip = active && chart.series[active.series]?.values[active.index] !== undefined
-    ? `${chart.labels[active.index]} · ${chart.series[active.series].label} · ${formatINR(chart.series[active.series].values[active.index])}`
+    ? `${chart.labels[active.index]} · ${chart.series[active.series].label} · ${formatValue(chart.series[active.series].values[active.index])}`
     : null
 
   return h('article', { className: 'finance-chart' },
     h('h4', null, chart.title),
     chart.has_activity && chart.labels.length
       ? h('div', { className: 'finance-chart-scroll' }, h('svg', {
-        viewBox: `0 0 ${width} 202`, 'aria-label': `${chart.title} in INR`,
+        viewBox: `0 0 ${width} 202`, 'aria-label': `${chart.title} in ${isCount ? 'records' : 'INR'}`,
       },
       ticks.map((tick) => h('g', { key: tick },
         h('line', { x1: left, x2: right, y1: y(tick), y2: y(tick), stroke: '#d0ccc4' }),
-        h('text', { x: left - 6, y: y(tick) + 4, textAnchor: 'end' }, axisMoney.format(tick)),
+        h('text', { x: left - 6, y: y(tick) + 4, textAnchor: 'end' }, (isCount ? countFormat : axisMoney).format(tick)),
       )),
       chart.labels.map((label, index) => index % advance === 0 && h('text', {
         key: index, x: x(index), y: bottom + 20, textAnchor: 'middle',
@@ -84,10 +88,10 @@ function FinanceChart({ chart }) {
           }),
           series.values.map((amount, index) => {
             const cy = y(Number(amount))
-            const description = `${chart.labels[index]}, ${series.label}: ${formatINR(amount)}`
+            const description = `${chart.labels[index]}, ${series.label}: ${formatValue(amount)}`
             const activate = () => setActive({ series: seriesIndex, index })
             return h('g', {
-              key: index, tabIndex: 0, 'aria-label': description, onMouseEnter: activate, onFocus: activate,
+              key: index, tabIndex: 0, 'aria-label': description, onMouseEnter: activate, onFocus: activate, onClick: activate,
             },
             h('title', null, description),
             chart.kind === 'line'
@@ -106,8 +110,14 @@ function FinanceChart({ chart }) {
       key: series.label,
     }, h('span', { style: { backgroundColor: colors[index] }, 'aria-hidden': true }), series.label))),
     tooltip && h('output', { 'aria-live': 'polite' }, tooltip),
-    chart.labels.length > 0 && h('details', null, h('summary', null, 'View data table'), h(ChartTable, { chart })),
+    chart.labels.length > 0 && h('details', null, h('summary', null, 'View data table'), h(ChartTable, { chart, formatValue })),
   )
+}
+
+export function ReportMetrics({ metrics }) {
+  if (!metrics.length) return null
+  return h('dl', { className: 'finance-metrics' }, metrics.map((metric, index) =>
+    h('div', { key: index }, h('dt', null, metric.label), h('dd', null, formatMetric(metric)))))
 }
 
 export default function FinanceReport({ report }) {
@@ -115,9 +125,8 @@ export default function FinanceReport({ report }) {
   const period = report.start_date ? `${report.start_date} to ${report.end_date}` : `As of ${report.end_date}`
   return h('section', { className: 'finance-report', 'aria-label': report.title },
     h('p', null, `${period} · ${report.timezone} · ${report.currency}`),
-    report.metrics.length > 0 && h('dl', { className: 'finance-metrics' }, report.metrics.map((metric, index) =>
-      h('div', { key: index }, h('dt', null, metric.label), h('dd', null, formatMetric(metric))))),
-    report.charts.map((chart) => h(FinanceChart, { key: chart.title, chart })),
+    h(ReportMetrics, { metrics: report.metrics }),
+    report.charts.map((chart) => h(ReportChart, { key: chart.title, chart })),
     report.notes.length > 0 && h('ul', { className: 'finance-notes' }, report.notes.map((note) => h('li', { key: note }, note))),
   )
 }

@@ -74,6 +74,8 @@ def create_appointment(
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
+    if current_user.role not in ("admin", "staff", "clinician", "patient"):
+        raise HTTPException(status_code=403, detail="Appointment creation is restricted")
     if current_user.role == "patient":
         patient = db.query(Patient).filter(Patient.user_id == current_user.id).first()
         if not patient:

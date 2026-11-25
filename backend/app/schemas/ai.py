@@ -3,6 +3,7 @@ from typing import Literal
 from pydantic import BaseModel, Field, field_validator
 
 from app.schemas.finance_analytics import FinanceReport
+from app.schemas.admin_analytics import AdminReport
 
 
 class ChatRequest(BaseModel):
@@ -28,10 +29,13 @@ class AIChatResponse(BaseModel):
 
     @field_validator("data")
     @classmethod
-    def validate_finance_report(cls, value):
+    def validate_reports(cls, value):
         if "finance_report" in value:
             report = FinanceReport.model_validate(value["finance_report"])
-            return {**value, "finance_report": report.model_dump(mode="json")}
+            value = {**value, "finance_report": report.model_dump(mode="json")}
+        if "admin_report" in value:
+            report = AdminReport.model_validate(value["admin_report"])
+            value = {**value, "admin_report": report.model_dump(mode="json")}
         return value
 
 

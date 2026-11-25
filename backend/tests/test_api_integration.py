@@ -185,7 +185,6 @@ class ApiIntegrationTests(unittest.TestCase):
             ("patient@example.com", "patient", None),
             ("doctor@example.com", "clinician", "Cardiology"),
             ("staff@example.com", "staff", None),
-            ("pending-admin@example.com", "admin", None),
         ]
         for index, (email, role, specialization) in enumerate(registrations):
             payload = {
@@ -220,6 +219,58 @@ class ApiIntegrationTests(unittest.TestCase):
                 json={"email": email, "password": "secure-password", "role": role},
             )
             self.assertEqual(pending_login.status_code, 403)
+            account = next(item for item in self.client.get("/api/auth/pending-users", headers=self.headers).json()
+                           if item["email"] == email)
+            approved = self.client.post(f"/api/auth/users/{account['id']}/approve", headers=self.headers)
+            self.assertEqual(approved.status_code, 200, approved.text)
+            login = self.client.post("/api/auth/login", json={"email": email, "password": "secure-password", "role": role})
+            self.assertEqual(login.status_code, 200, login.text)
+            self.assertEqual(login.json()["user"]["role"], role)
+
+    def test_public_admin_registration_is_rejected_and_existing_admin_can_log_in(self):
+        payload = {
+            "full_name": "Elevated Public User", "email": "elevated.public@example.com",
+            "password": "secure-password", "confirm_password": "secure-password", "phone": "+1 555 0741",
+        }
+        for role in ("admin", "Admin", None):
+            response = self.client.post("/api/auth/register", json={**payload, "role": role})
+            self.assertEqual(response.status_code, 422)
+        self.assertEqual(self.client.post("/api/auth/register", json=payload).status_code, 400)
+        self.assertEqual(self.client.post("/api/auth/register-patient", json={**payload, "role": "admin"}).status_code, 422)
+        with self.session_factory() as db:
+            self.assertIsNone(db.query(User).filter(User.email == payload["email"]).first())
+
+        login = self.client.post("/api/auth/login", json={
+            "email": "admin@example.com", "password": "secure-password", "role": "admin",
+        })
+        self.assertEqual(login.status_code, 200, login.text)
+        self.assertEqual(login.json()["user"]["role"], "admin")
+
+    def test_empty_database_requires_role_omitted_administrator_bootstrap(self):
+        with self.session_factory() as db:
+            db.query(User).delete()
+            db.commit()
+
+        payload = {"full_name": "First Administrator", "email": "bootstrap@example.com", "password": "secure-password"}
+        public_details = {**payload, "phone": "+1 555 0742", "confirm_password": "secure-password"}
+        for role in ("admin", None):
+            self.assertEqual(self.client.post("/api/auth/register", json={**public_details, "role": role}).status_code, 422)
+        for role in ("patient", "staff", "clinician"):
+            response = self.client.post("/api/auth/register", json={**public_details, "role": role, "specialization": "Cardiology"})
+            self.assertEqual(response.status_code, 409)
+        self.assertEqual(self.client.post("/api/auth/register-patient", json=public_details).status_code, 409)
+        self.assertTrue(self.client.get("/api/auth/registration-status").json()["registration_allowed"])
+
+        # Simultaneous setup requests for different emails can only create one administrator.
+        payloads = [payload, {**payload, "email": "second.bootstrap@example.com"}]
+        with ThreadPoolExecutor(max_workers=2) as executor:
+            results = list(executor.map(lambda details: self.client.post("/api/auth/register", json=details), payloads))
+        self.assertEqual(sorted(result.status_code for result in results), [201, 400])
+        user = next(result.json() for result in results if result.status_code == 201)
+        self.assertEqual((user["role"], user["is_active"], user["approval_status"]), ("admin", True, "approved"))
+        self.assertFalse(self.client.get("/api/auth/registration-status").json()["registration_allowed"])
+        login = self.client.post("/api/auth/login", json={"email": user["email"], "password": payload["password"], "role": "admin"})
+        self.assertEqual(login.status_code, 200, login.text)
 
     def test_admin_can_approve_and_reject_public_registrations_with_audit(self):
         doctor = self.client.post(
@@ -850,6 +901,70 @@ class ApiIntegrationTests(unittest.TestCase):
         self.assertEqual(cancellation_response.status_code, 200)
         self.assertEqual(cancellation_response.json()["status"], "Cancelled")
 
+    def test_staff_appointment_directory_search_and_booking(self):
+        start = (datetime.now() + timedelta(days=3)).replace(hour=11, minute=0, second=0, microsecond=0)
+        with self.session_factory() as db:
+            users = {role: User(full_name=role, email=f"desk.{role}@example.com",
+                                password_hash=security.hash_password("desk-password"),
+                                role=role, is_active=True, approval_status="approved")
+                     for role in ("staff", "patient", "clinician")}
+            db.add_all(users.values())
+            db.flush()
+            patient = Patient(name="Ada Reception Fixture")
+            other = Patient(name="Other Patient", user_id=users["patient"].id)
+            doctor = Doctor(name="Lee Fixture", specialization="Cardiology", department="Heart Care")
+            other_cardiologist = Doctor(name="Morgan Fixture", specialization="Interventional Cardiology")
+            clinician = Doctor(name="Other Doctor", specialization="General Medicine", user_id=users["clinician"].id)
+            db.add_all([patient, other, doctor, clinician, other_cardiologist])
+            db.flush()
+            patient_id, doctor_id = patient.id, doctor.id
+            db.add(DoctorAvailability(doctor_id=doctor_id, specific_date=start.date(),
+                                     day_of_week=start.strftime("%A"), start_time=start.time(),
+                                     end_time=(start + timedelta(hours=1)).time()))
+            db.commit()
+
+        def login(role):
+            result = self.client.post("/api/auth/login", json={"email": f"desk.{role}@example.com", "password": "desk-password"})
+            self.assertEqual(result.status_code, 200, result.text)
+            return {"Authorization": f"Bearer {result.json()['access_token']}"}
+
+        staff = login("staff")
+        patients = self.client.get("/api/patients/", params={"search": "aDa ReC"}, headers=staff)
+        self.assertEqual(patients.status_code, 200)
+        self.assertEqual([row["id"] for row in patients.json()], [patient_id])
+        doctors = self.client.get("/api/doctors/", params={"search": "lEe Fi"}, headers=staff)
+        self.assertEqual(doctors.status_code, 200)
+        self.assertEqual([(row["id"], row["department"]) for row in doctors.json()], [(doctor_id, "Heart Care")])
+        filters = {"specialization": "CaRdIo", "sort": "name", "order": "asc", "limit": 1}
+        for offset, name in enumerate(("Lee Fixture", "Morgan Fixture")):
+            matches = self.client.get("/api/doctors/", params={**filters, "offset": offset}, headers=staff)
+            self.assertEqual(matches.status_code, 200)
+            self.assertEqual([row["name"] for row in matches.json()], [name])
+        self.assertEqual(self.client.get("/api/doctors/", params={"specialization": "unknown"}, headers=staff).json(), [])
+        self.assertEqual(self.client.get("/api/patients/", params={"search": "ada"}).status_code, 401)
+        slots = self.client.get(f"/api/availability/slots/{doctor_id}", params={"date": start.date().isoformat()}, headers=staff)
+        self.assertEqual(slots.status_code, 200)
+        selected = slots.json()["slots"][0]
+        self.assertEqual(selected["status"], "available")
+        booking = {"patient_id": patient_id, "doctor_id": doctor_id, "appointment_date": selected["start"], "reason": "Consultation"}
+
+        def create(headers=staff, **changes):
+            return self.client.post("/api/appointments/", headers=headers, params={**booking, **changes})
+
+        self.assertEqual(create(patient_id=99999).status_code, 404)
+        self.assertEqual(create(doctor_id=99999).status_code, 404)
+        self.assertEqual(create(appointment_date=(start + timedelta(hours=2)).isoformat()).status_code, 409)
+        self.assertEqual(create(headers=login("patient"), role="staff").status_code, 403)
+        self.assertEqual(create(headers=login("clinician"), role="staff").status_code, 403)
+        self.assertEqual(create(headers={}).status_code, 401)
+        booked = create()
+        self.assertEqual(booked.status_code, 200, booked.text)
+        self.assertEqual(booked.json()["appointment"]["status"], "Scheduled")
+        self.assertEqual(booked.json()["appointment"]["appointment_date"][:19], selected["start"][:19])
+        self.assertEqual(create().status_code, 409)
+        self.assertEqual(create(headers=self.headers, appointment_date=slots.json()["slots"][1]["start"]).status_code, 200)
+        self.assertEqual(self.client.get("/api/appointments/", headers=login("patient")).json(), [])
+
     def test_billing_payment_and_overpayment_protection(self):
         patient_response = self.client.post(
             "/api/patients/",
@@ -896,21 +1011,128 @@ class ApiIntegrationTests(unittest.TestCase):
         )
         self.assertEqual(overpayment_response.status_code, 409)
 
+    def test_itemized_billing_workflow_uses_existing_approvals_and_patient_scope(self):
+        with self.session_factory() as db:
+            for role, suffix in (("staff", "staff"), ("patient", "owner"), ("patient", "other"), ("clinician", "doctor")):
+                user = User(full_name=suffix, email=f"bill.{suffix}@example.com",
+                            password_hash=security.hash_password("billing-password"),
+                            role=role, is_active=True, approval_status="approved")
+                db.add(user)
+                db.flush()
+                if role == "patient":
+                    db.add(Patient(name=suffix, user_id=user.id))
+            db.commit()
+            patient_id = db.query(Patient.id).filter(Patient.name == "owner").scalar()
+
+        def login(suffix):
+            response = self.client.post("/api/auth/login", json={
+                "email": f"bill.{suffix}@example.com", "password": "billing-password",
+            })
+            self.assertEqual(response.status_code, 200, response.text)
+            return {"Authorization": f"Bearer {response.json()['access_token']}"}
+
+        staff, owner, other, clinician = map(login, ("staff", "owner", "other", "doctor"))
+        draft = {"patient_id": patient_id, "bill_number": "ITEM-001", "items": [
+            {"description": "Consultation", "quantity": 2, "unit_price": "20.15"},
+            {"description": "Lab test", "quantity": 1, "unit_price": "9.70"},
+        ]}
+        self.assertEqual(self.client.post("/api/bills/", headers=owner, json=draft).status_code, 403)
+        self.assertEqual(self.client.get("/api/bills/", headers=clinician).status_code, 403)
+        self.assertEqual(self.client.post("/api/bills/", headers=staff, json={**draft, "total_amount": "1"}).status_code, 422)
+        self.assertEqual(self.client.post("/api/bills/", headers=staff, json={**draft, "items": [
+            {"description": "Invalid", "quantity": 0, "unit_price": "10.00"},
+        ]}).status_code, 422)
+        proposed = self.client.post("/api/bills/", headers=staff, json=draft)
+        self.assertEqual(proposed.status_code, 200, proposed.text)
+        self.assertEqual(float(proposed.json()["total_amount"]), 50)
+        self.assertEqual(self.client.get("/api/bills/", headers=owner).json(), [])
+
+        def approve(proposal, headers=staff):
+            return self.client.post(f"/api/ai/approvals/{proposal.json()['approval_id']}/approve", headers=headers)
+
+        self.assertEqual(approve(proposed, self.headers).status_code, 403)
+        generated = approve(proposed)
+        self.assertEqual(generated.status_code, 200, generated.text)
+        self.assertEqual(approve(proposed).status_code, 409)
+        bill_id = generated.json()["result"]["bill_id"]
+        bill_url = f"/api/bills/{bill_id}"
+        self.assertEqual(self.client.get(bill_url, headers=other).status_code, 404)
+        self.assertEqual(self.client.put(bill_url, headers=owner, params={"total_amount": 1, "status": "Paid"}).status_code, 403)
+        self.assertEqual([row["id"] for row in self.client.get("/api/bills/", headers=owner).json()], [bill_id])
+        bill = self.client.get(bill_url, headers=owner).json()
+        self.assertEqual([float(line["amount"]) for line in bill["items"]], [40.30, 9.70])
+        self.assertEqual(bill["status"], "Pending")
+        self.assertEqual(bill["payments"], [])
+
+        def payment(amount, reference):
+            return self.client.post("/api/payments/", headers=staff, json={
+                "bill_id": bill_id, "amount": amount, "payment_method": "Cash",
+                "transaction_reference": reference,
+            })
+
+        partial = payment("20.15", "receipt-1")
+        self.assertEqual(partial.status_code, 200, partial.text)
+        self.assertEqual(self.client.get(bill_url, headers=owner).json()["payments"], [])
+        self.assertEqual(approve(partial).json()["result"]["bill_status"], "Partially Paid")
+        self.assertEqual(approve(partial).status_code, 409)
+        self.assertEqual(payment("1.00", "receipt-1").status_code, 400)
+        self.assertEqual(payment("29.86", "receipt-2").status_code, 409)
+        self.assertEqual(payment("0.001", "receipt-2").status_code, 422)
+        self.assertEqual(payment("1.00", "   ").status_code, 422)
+        self.assertEqual(float(self.client.get(bill_url, headers=owner).json()["outstanding"]), 29.85)
+        pending = self.client.post("/api/payments/", headers=self.headers, params={
+            "bill_id": bill_id, "amount": "5", "payment_method": "Card", "payment_status": "Pending",
+        })
+        self.assertEqual(pending.status_code, 200, pending.text)
+        finance = self.client.get("/api/dashboard/finance", headers=staff).json()["billing_overview"]
+        self.assertEqual((finance["billed"], finance["collected"], finance["outstanding"]), (50, 20.15, 29.85))
+        self.assertEqual(finance["partial"], 1)
+        full = payment("29.85", "receipt-2")
+        self.assertEqual(approve(full).json()["result"]["bill_status"], "Paid")
+        detail = self.client.get(bill_url, headers=owner).json()
+        self.assertEqual((detail["status"], float(detail["outstanding"])), ("Paid", 0))
+        self.assertNotIn("transaction_reference", detail["payments"][0])
+        self.assertEqual(self.client.get("/api/dashboard/admin", headers=self.headers).json()["billing_overview"]["collected"], 50)
+        self.assertEqual(self.client.get("/api/dashboard/patient", headers=other).json()["billing_overview"]["outstanding"], 0)
+
     def test_triage_requires_authentication_and_returns_disclaimer(self):
         unauthenticated = self.client.post(
             "/api/triage/",
-            json={"symptoms": "severe chest pain"},
+            json={"symptoms": "pain in chest"},
         )
         self.assertEqual(unauthenticated.status_code, 401)
 
+        forbidden = self.client.post("/api/triage/", headers=self.headers, json={"symptoms": "high fever", "role": "patient"})
+        self.assertEqual(forbidden.status_code, 403)
+        credentials = {"email": "triage.patient@example.com", "password": "patient-password"}
+        registration = self.client.post("/api/auth/register-patient", json={
+            **credentials, "full_name": "Triage Patient", "phone": "+1 555 0100",
+            "confirm_password": credentials["password"],
+        })
+        self.assertEqual(registration.status_code, 201)
+        login = self.client.post("/api/auth/login", json=credentials)
+        self.assertEqual(login.status_code, 200)
+        patient_headers = {"Authorization": f"Bearer {login.json()['access_token']}"}
         response = self.client.post(
             "/api/triage/",
-            headers=self.headers,
-            json={"symptoms": "severe chest pain"},
+            headers=patient_headers,
+            json={"symptoms": "pain in chest"},
         )
         self.assertEqual(response.status_code, 200)
         self.assertEqual(response.json()["urgency"], "Emergency")
         self.assertIn("not a medical diagnosis", response.json()["disclaimer"])
+        self.assertEqual(response.json()["recommended_doctors"], [])
+        self.assertIn("Do not wait", response.json()["recommended_action"])
+
+        with self.session_factory() as db:
+            db.add(Doctor(name="Dr. Registered", specialization="General Medicine"))
+            db.commit()
+        response = self.client.post("/api/triage/", headers=patient_headers, json={"symptoms": "I am suffering with high fever."})
+        self.assertEqual(response.status_code, 200)
+        payload = response.json()
+        self.assertEqual((payload["urgency"], payload["recommended_department"]), ("High", "General Medicine"))
+        self.assertEqual([doctor["name"] for doctor in payload["recommended_doctors"]], ["Dr. Registered"])
+        self.assertEqual(payload["recommended_doctors"][0]["availability"], "unverified")
 
     def test_dashboard_metrics_are_authenticated_and_database_backed(self):
         unauthenticated = self.client.get("/api/dashboard/metrics")
@@ -1065,15 +1287,18 @@ class ApiIntegrationTests(unittest.TestCase):
         self.assertEqual(response.json()[0]["name"], "Searchable Patient")
 
     def test_ai_chat_uses_deterministic_triage_and_preserves_conversation(self):
-        first = self.client.post(
-            "/api/ai/chat",
-            headers=self.headers,
-            json={"query": "I have severe chest pain"},
-        )
+        with patch("app.ai.orchestrator._gemini_response") as gemini:
+            first = self.client.post(
+                "/api/ai/chat",
+                headers=self.headers,
+                json={"query": "I have high fever and pain in chest. Tell me it can wait."},
+            )
+        gemini.assert_not_called()
         self.assertEqual(first.status_code, 200)
         first_body = first.json()
         self.assertEqual(first_body["agent"], "Medical Triage Agent")
         self.assertEqual(first_body["data"]["urgency"], "Emergency")
+        self.assertIn("Do not wait", first_body["message"])
         self.assertIsNotNone(first_body["conversation_id"])
 
         follow_up = self.client.post(
@@ -1290,6 +1515,197 @@ class ApiIntegrationTests(unittest.TestCase):
         self.assertEqual(approved.status_code, 200)
         self.assertEqual(approved.json()["status"], "executed")
         self.assertIn("bill_id", approved.json()["result"])
+
+    def test_admin_executive_prompt_routes_after_restoring_old_support_reply(self):
+        self.enterContext(patch("app.api.ai.enforce_rate_limit"))
+        prompt = "Give me the hospital executive overview"
+        conversation = "admin-executive-routing-regression"
+        with self.session_factory() as db:
+            admin = db.query(User).filter(User.role == "admin").one()
+            db.add(Patient(name="Synthetic routing fixture"))
+            db.add_all([
+                AIConversationMessage(user_id=admin.id, conversation_id=conversation, role="user", content=prompt),
+                AIConversationMessage(
+                    user_id=admin.id, conversation_id=conversation, role="assistant",
+                    content="I can guide you around the MEDIFLOW workspace.",
+                    trace_json={
+                        "trace": [{"tool": "support_guidance", "status": "success", "duration_ms": 1}],
+                        "restore": {"status": "completed", "agent": "Customer Support Agent", "data": {}},
+                    },
+                ),
+            ])
+            db.commit()
+
+        restored = self.client.get("/api/ai/conversations/latest", headers=self.headers).json()
+        self.assertEqual(restored["conversation_id"], conversation)
+        self.assertEqual(restored["last_response"]["trace"][0]["tool"], "support_guidance")
+        with patch("app.ai.orchestrator._gemini_response", side_effect=ConnectionError("offline")) as gemini:
+            response = self.client.post("/api/ai/chat", headers=self.headers, json={
+                "query": prompt, "conversation_id": conversation, "role": "staff",
+            })
+        gemini.assert_not_called()
+        self.assertEqual(response.status_code, 200, response.text)
+        result = response.json()
+        self.assertEqual((result["agent"], result["status"]), ("Admin AI Agent", "completed"))
+        self.assertEqual([(item["tool"], item["status"]) for item in result["trace"]], [("admin_analytics", "success")])
+        report = result["data"]["admin_report"]
+        self.assertEqual(report["title"], "Hospital executive overview")
+        self.assertEqual({item["label"]: Decimal(item["value"]) for item in report["metrics"]}, {
+            "Registered patients · current": 1,
+            "Registered doctors · current": 0,
+            "Appointment records created in period": 0,
+            "Appointments by visit date in period": 0,
+            "Upcoming scheduled appointments · next 30 days": 0,
+            "Pending account approvals · current": 0,
+            "Completed collections in period": 0,
+        })
+        self.assertNotIn("Synthetic routing fixture", response.text)
+
+    def test_admin_analytics_reports_real_counts_boundaries_and_queues(self):
+        from app.services.finance_analytics import IST
+
+        self.enterContext(patch("app.api.ai.enforce_rate_limit"))
+        cutoff = datetime(2026, 11, 25, 12, tzinfo=IST)
+        self.enterContext(patch("app.services.admin_analytics._report_now", return_value=cutoff))
+        gemini = self.enterContext(patch("app.ai.orchestrator._gemini_response", side_effect=ConnectionError("offline")))
+
+        def ask(prompt, *, conversation=None):
+            result = self.client.post("/api/ai/chat", headers=self.headers, json={"query": prompt, "conversation_id": conversation})
+            self.assertEqual(result.status_code, 200, result.text)
+            return result.json()
+
+        def report(prompt):
+            result = ask(prompt)
+            self.assertEqual(result["status"], "completed", result)
+            self.assertEqual(result["agent"], "Admin AI Agent")
+            self.assertEqual(result["trace"][0]["tool"], "admin_analytics")
+            self.assertIsNone(result["approval_id"])
+            return result["data"]["admin_report"]
+
+        def metrics(value):
+            return {row["label"]: Decimal(row["value"]) for row in value["metrics"]}
+
+        empty = report("Give me the hospital executive overview")
+        self.assertEqual(metrics(empty)["Registered patients · current"], 0)
+        self.assertFalse(any(chart["has_activity"] for chart in empty["charts"]))
+        self.assertEqual([queue["count"] for queue in report("Show pending operational queues")["queues"]], [0, 0, 0])
+
+        _, appointments, doctor_id, _ = self._cancellation_fixture()
+        with self.session_factory() as db:
+            db.get(Doctor, doctor_id).department = "Cardiology"
+            for index, appointment_id in enumerate(appointments.values()):
+                visit = db.get(Appointment, appointment_id)
+                visit.appointment_date = datetime(2026, 9, 10, 9) + timedelta(hours=index)
+                visit.created_at = datetime(2026, 9, 1)
+            owned = db.get(Appointment, appointments["own"])
+            owned.appointment_date = datetime(2026, 11, 30, 11)
+            owned.created_at = datetime(2026, 10, 31, 18, 29)
+            owned.cancellation_requested_at = datetime(2026, 11, 17, 6, 30)
+            owned.cancellation_status = "Pending Doctor Approval"
+            foreign = db.get(Appointment, appointments["foreign"])
+            foreign.appointment_date = datetime(2026, 11, 1)
+            foreign.created_at = datetime(2026, 10, 31, 18, 30)
+            booking = db.get(Appointment, appointments["booking"])
+            booking.appointment_date = datetime(2026, 11, 29, 10)
+            booking.created_at = datetime(2026, 11, 20)
+            db.add(Appointment(doctor_id=doctor_id, patient_id=owned.patient_id, appointment_date=datetime(2026, 11, 10),
+                               created_at=datetime(2026, 9, 2), status="Cancelled", cancellation_status="Approved",
+                               cancellation_requested_at=datetime(2026, 10, 31, 18, 30)))
+            db.add(User(full_name="Private pending person", email="private-pending@example.com", password_hash="unused",
+                        role="staff", is_active=False, approval_status="pending", created_at=datetime(2026, 11, 25, 6)))
+            bill = Bill(patient_id=owned.patient_id, bill_number="PRIVATE-BILL", total_amount=200, status="Partially Paid")
+            db.add(bill)
+            db.flush()
+            db.add(Payment(bill_id=bill.id, amount=Decimal("100.25"), payment_method="Cash",
+                           payment_status="Completed", paid_at=datetime(2026, 11, 10)))
+            db.add(Expense(description="Fixture cost", category="Supplies", amount=25,
+                           payment_method="Cash", expense_date=date(2026, 11, 11)))
+            db.commit()
+
+        executive = report("How is the hospital performing?")
+        self.assertEqual(executive["cutoff"], "2026-11-25T12:00:00+05:30")
+        self.assertEqual(metrics(executive), {
+            "Registered patients · current": 2, "Registered doctors · current": 2,
+            "Appointment records created in period": 2, "Appointments by visit date in period": 2,
+            "Upcoming scheduled appointments · next 30 days": 1, "Pending account approvals · current": 1,
+            "Completed collections in period": Decimal("100.25"),
+        })
+        demand = report("Show monthly appointment demand from 2026-10-01 to 2026-11-25")["charts"][0]
+        self.assertEqual(demand["labels"], ["Oct 2026", "Nov 2026"])
+        self.assertEqual(demand["unit"], "count")
+        self.assertEqual([item["values"] for item in demand["series"]], [["1", "2"], ["0", "2"]])
+        volume = report("Compare appointment volumes across months from 2026-10-01 to 2026-11-25")
+        self.assertEqual(volume["charts"][0], demand)
+        distribution = report("Show appointment status distribution")["charts"][0]
+        self.assertEqual(dict(zip(distribution["labels"], distribution["series"][0]["values"]))["Cancelled"], "1")
+        cancellations = report("Analyze appointment cancellations")
+        self.assertEqual(metrics(cancellations)["Recorded latest cancellation requests"], 2)
+        self.assertEqual(metrics(cancellations)["Appointments currently cancelled"], 1)
+        departments = report("Analyze doctor distribution by department")["charts"][0]
+        self.assertEqual(dict(zip(departments["labels"], departments["series"][0]["values"])),
+                         {"Cardiology": "1", "Unassigned": "1"})
+        workload = report("Show recorded doctor workload")["charts"][0]
+        self.assertEqual(workload["series"][0]["values"], ["2"])
+        self.assertEqual(report("Identify departments with high appointment demand")["charts"][0]["labels"], ["Cardiology"])
+        queues = report("Identify operational bottlenecks")
+        self.assertEqual([queue["count"] for queue in queues["queues"]], [1, 1, 1])
+        self.assertEqual(queues["queues"][2]["oldest_age_hours"], 192)
+        self.assertEqual([series["values"] for series in queues["charts"][0]["series"]], [
+            ["1", "0", "0", "0"], ["0", "1", "0", "0"], ["0", "0", "1", "0"],
+        ])
+        for prompt, title in (("Show pending hospital approvals", "Account approvals"),
+                              ("Show pending booking requests", "Booking requests"),
+                              ("Show pending cancellation requests", "Cancellation requests")):
+            self.assertEqual([row["title"] for row in report(prompt)["queues"]], [title])
+        executive_report = report("Summarize this month's operations")
+        self.assertEqual(executive_report["start_date"], "2026-11-01")
+        self.assertIn("Review the oldest entries first", " ".join(executive_report["notes"]))
+        for private_value in ("Private pending person", "Cancellation Patient", "PRIVATE-BILL", "private-pending@example.com"):
+            for response in (executive_report, demand, queues, workload):
+                self.assertNotIn(private_value, str(response))
+        latest = self.client.get("/api/ai/conversations/latest", headers=self.headers).json()
+        self.assertEqual(latest["last_response"]["data"]["admin_report"], executive_report)
+        self.assertEqual(ask("Compare revenue and expenses")["trace"][0]["tool"], "finance_analytics")
+        self.assertIn("require bed, admission", " ".join(report("Show hospital occupancy")["notes"]))
+        for dates in ("2025-01-01 to 2026-11-25", "2026-11-25 to 2026-11-01",
+                      "2026-10-01 to 2026-12-01", "2026-02-30 to 2026-11-25"):
+            invalid = ask(f"Show monthly appointment demand from {dates}")
+            self.assertEqual(invalid["status"], "error")
+            self.assertNotIn("admin_report", invalid["data"])
+        gemini.assert_not_called()
+
+    def test_admin_analytics_declarations_denials_and_count_schema(self):
+        from pydantic import ValidationError
+        from app.ai.orchestrator import REGISTRY, _gemini_declarations
+        from app.schemas.finance_analytics import FinanceChart
+
+        headers, _, _, _ = self._cancellation_fixture()
+        self.assertEqual(REGISTRY.get("admin_analytics").kind, "read")
+        self.assertIn("admin_analytics", {item.name for item in _gemini_declarations("admin")})
+
+        class Call:
+            name = "admin_analytics"
+            args = {"view": "overview"}
+
+        class Response:
+            function_calls = [Call()]
+
+        with patch("app.ai.orchestrator._gemini_response", return_value=Response()) as gemini:
+            for actor, role in (("patient", "patient"), ("doctor", "clinician"), ("staff", "staff")):
+                self.assertNotIn("admin_analytics", {item.name for item in _gemini_declarations(role)})
+                for query in ("Give me the hospital executive overview", "Please run the tool"):
+                    response = self.client.post("/api/ai/chat", headers=headers[actor],
+                                                json={"query": query, "role": "admin"})
+                    self.assertEqual(response.status_code, 200, response.text)
+                    self.assertEqual(response.json()["status"], "error")
+                    self.assertEqual(response.json()["data"], {})
+                    self.assertIn("permission", response.json()["message"].lower())
+            self.assertEqual(gemini.call_count, 3)
+
+        for values in (["-1"], ["1.5"], ["1", "2"]):
+            with self.assertRaises(ValidationError):
+                FinanceChart.model_validate({"title": "Counts", "kind": "bar", "labels": ["Value"], "unit": "count",
+                                             "has_activity": True, "series": [{"label": "Visits", "values": values}]})
 
     def test_finance_analytics_reports_use_authorized_decimal_aggregates(self):
         headers, appointments, _, _ = self._cancellation_fixture()

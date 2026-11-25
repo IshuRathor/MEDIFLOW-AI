@@ -5,6 +5,7 @@ export type FinanceChartData = {
   kind: 'line' | 'bar'
   labels: string[]
   has_activity: boolean
+  unit?: 'INR' | 'count'
   series: Array<{ label: string; values: string[] }>
 }
 
@@ -21,4 +22,6 @@ export type FinanceReportData = {
 
 export const financePrompts: string[]
 export function formatINR(value: number | string): string
+export function ReportChart(props: { chart: FinanceChartData }): ReactElement
+export function ReportMetrics(props: { metrics: FinanceReportData['metrics'] }): ReactElement | null
 export default function FinanceReport(props: { report?: FinanceReportData }): ReactElement | null

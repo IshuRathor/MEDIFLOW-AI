@@ -16,9 +16,9 @@ from app.models.availability import DoctorAvailability
 from app.api.availability import generate_slots
 from app.models.doctor import Doctor
 from app.models.patient import Patient
-from app.models.finance import Bill, Payment
 from app.models.user import User
 from app.schemas.ai import AIChatResponse, ApprovalResponse, ChatRequest
+from app.services.billing import BILLING_REVIEW_PREFIX, generate_bill, record_payment
 from app.services.finance_analytics import FINANCE_ROLES
 from app.services.cancellation import (
     REQUEST_CANCELLATION, appointment_card, cancellation_choices, eligible_appointments,
@@ -36,6 +36,8 @@ def _restorable_chat_data(data: dict) -> dict:
     if not isinstance(data, dict):
         return {}
     restored = {}
+    if isinstance(data.get("admin_view"), dict):
+        restored["admin_view"] = data["admin_view"]
     if isinstance(data.get("finance_view"), dict):
         restored["finance_view"] = data["finance_view"]
     if isinstance(data.get("doctor_view"), dict):
@@ -73,6 +75,8 @@ def _restorable_chat_data(data: dict) -> dict:
 
 
 def _add_approval_outcome_message(db: Session, approval: AIApproval, user_id: int, message: str):
+    if approval.action in {"generate_bill", "record_payment"} and approval.conversation_id.startswith(BILLING_REVIEW_PREFIX):
+        return
     db.add(AIConversationMessage(
         user_id=user_id,
         conversation_id=approval.conversation_id,
@@ -241,6 +245,15 @@ def latest_conversation(
     last_response = metadata.get("restore") if isinstance(metadata.get("restore"), dict) else None
     if last_response is not None:
         last_response = {**last_response, "trace": metadata.get("trace", [])}
+        admin_view = last_response.get("data", {}).get("admin_view")
+        if current_user.role == "admin" and isinstance(admin_view, dict):
+            result, trace = REGISTRY.execute("admin_analytics", current_user, db, admin_view)
+            last_response.update(
+                status="error" if result["status"] == "error" else "completed",
+                data={"admin_report": result["admin_report"]} if "admin_report" in result else {},
+                trace=[trace],
+            )
+            restored_messages[messages.index(last_assistant)] = {"role": "assistant", "content": result["message"]}
         finance_view = last_response.get("data", {}).get("finance_view")
         if current_user.role in FINANCE_ROLES and isinstance(finance_view, dict):
             result, trace = REGISTRY.execute("finance_analytics", current_user, db, finance_view)
@@ -638,22 +651,10 @@ def decide_approval(
             if current_user.role not in ("admin", "staff"):
                 raise HTTPException(status_code=403, detail="Only administrators or finance staff can generate bills")
             parameters = approval.parameters_json
-            patient = db.query(Patient).filter(Patient.id == int(parameters["patient_id"])).first()
-            if not patient:
-                raise HTTPException(status_code=404, detail="Patient not found")
-            existing = db.query(Bill).filter(Bill.bill_number == str(parameters["bill_number"])).first()
-            if existing:
-                raise HTTPException(status_code=409, detail="Bill number already exists")
-            amount = float(parameters["total_amount"])
-            if amount <= 0:
-                raise HTTPException(status_code=400, detail="Bill amount must be greater than zero")
-            bill = Bill(
-                patient_id=patient.id,
-                bill_number=str(parameters["bill_number"]),
-                total_amount=amount,
-                status="Pending",
+            bill = generate_bill(
+                db, int(parameters["patient_id"]), str(parameters["bill_number"]),
+                items=parameters.get("items"), total_amount=parameters.get("total_amount"),
             )
-            db.add(bill)
             approval.status = "executed"
             approval.executed_at = datetime.now(timezone.utc)
             db.flush()
@@ -673,42 +674,17 @@ def decide_approval(
             if current_user.role not in ("admin", "staff"):
                 raise HTTPException(status_code=403, detail="Only administrators or finance staff can record payments")
             parameters = approval.parameters_json
-            bill = db.query(Bill).filter(Bill.id == int(parameters["bill_id"])).with_for_update().first()
-            if not bill:
-                raise HTTPException(status_code=404, detail="Bill not found")
-            if bill.status == "Cancelled":
-                raise HTTPException(status_code=409, detail="Payments cannot be recorded against a cancelled bill")
-            amount = float(parameters["amount"])
-            if amount <= 0:
-                raise HTTPException(status_code=400, detail="Payment amount must be greater than zero")
-            completed = (
-                db.query(Payment)
-                .filter(Payment.bill_id == bill.id, Payment.payment_status == "Completed")
-                .all()
+            bill, payment = record_payment(
+                db, int(parameters["bill_id"]), parameters["amount"],
+                parameters["payment_method"], parameters.get("transaction_reference"),
             )
-            completed_total = sum((float(payment.amount) for payment in completed), 0.0)
-            if amount > float(bill.total_amount) - completed_total:
-                raise HTTPException(status_code=409, detail="Payment exceeds the bill's outstanding balance")
-            payment_method = str(parameters["payment_method"])
-            if payment_method not in {"Cash", "Card", "Bank Transfer", "Insurance", "Other"}:
-                raise HTTPException(status_code=400, detail="Invalid payment method")
-            payment = Payment(
-                bill_id=bill.id,
-                amount=amount,
-                payment_method=payment_method,
-                payment_status="Completed",
-            )
-            db.add(payment)
-            db.flush()
-            paid_total = completed_total + amount
-            bill.status = "Paid" if paid_total >= float(bill.total_amount) else "Partially Paid"
             approval.status = "executed"
             approval.executed_at = datetime.now(timezone.utc)
             approval.execution_result_json = {
                 "message": "Payment recorded successfully",
                 "payment_id": payment.id,
                 "bill_id": bill.id,
-                "amount": amount,
+                "amount": float(payment.amount),
                 "bill_status": bill.status,
             }
             _add_approval_outcome_message(db, approval, current_user.id, approval.execution_result_json["message"])
@@ -730,7 +706,7 @@ def decide_approval(
         raise
     except IntegrityError:
         db.rollback()
-        raise HTTPException(status_code=409, detail="The operation is already executed or conflicts with another appointment")
+        raise HTTPException(status_code=409, detail="The operation is already executed or conflicts with an existing record")
     except SQLAlchemyError:
         db.rollback()
         try:

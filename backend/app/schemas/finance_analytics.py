@@ -16,11 +16,17 @@ class FinanceChart(BaseModel):
     labels: list[str] = Field(max_length=100)
     series: list[FinanceSeries] = Field(min_length=1, max_length=4)
     has_activity: bool
+    unit: Literal["INR", "count"] = "INR"
 
     @model_validator(mode="after")
     def check_alignment(self):
         if any(len(series.values) != len(self.labels) for series in self.series):
             raise ValueError("Each series must supply a value for every label")
+        if self.unit == "count" and any(
+            value < 0 or value != value.to_integral_value()
+            for series in self.series for value in series.values
+        ):
+            raise ValueError("Chart counts must be non-negative integers")
         return self
 
 
