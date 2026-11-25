@@ -1,27 +1,10 @@
-import os
 from datetime import date, datetime, timedelta
-
-from dotenv import load_dotenv
-from google import genai
 
 from app.agents.hospital_agent import hospital_agent
 from app.agents.finance_agent import finance_agent
 from app.agents.support_agent import support_agent
+from app.ai.gemini_client import client
 from app.services.triage_service import triage_patient
-
-
-load_dotenv()
-
-GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
-
-client = (
-    genai.Client(
-        api_key=GEMINI_API_KEY,
-        http_options=genai.types.HttpOptions(timeout=10000),
-    )
-    if GEMINI_API_KEY
-    else None
-)
 
 
 def get_next_working_day(schedule):

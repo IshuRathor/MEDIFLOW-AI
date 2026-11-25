@@ -7,8 +7,9 @@ MEDIFLOW AI is a role-based hospital operations platform built with FastAPI, Pos
 - Administrator, Doctor, Finance Staff, and Patient dashboards
 - JWT authentication and role-based authorization
 - Patient and doctor ownership restrictions
-- Appointment scheduling and doctor availability management
-- Billing, payments, financial summaries and transaction history
+- Slot-based patient booking and cancellation requests with doctor review
+- Doctor briefings, weekly workload and assigned-patient appointment timelines
+- Billing, payments, INR finance reports and interactive charts
 - AI-assisted triage, hospital operations and support
 - Database-backed conversation history and expiring approval records
 - Deterministic fallback routing when Gemini is unavailable
@@ -25,7 +26,29 @@ MEDIFLOW AI is a role-based hospital operations platform built with FastAPI, Pos
 
 The frontend communicates with FastAPI REST endpoints. The backend separates authentication, operational models, role-specific dashboards, appointment scheduling, billing, and AI orchestration.
 
-The AI system uses one main orchestrator and specialized Hospital, Finance, Support and Triage behaviors backed by a validated tool registry. Sensitive operations require explicit user approval, and tools enforce server-side authorization and ownership.
+One authenticated orchestrator and ToolRegistry serve all four workspaces. The backend resolves account roles, validates tool inputs and checks ownership. Support and triage are shared capabilities.
+
+| AI experience | Account role | Implemented capabilities |
+|---|---|---|
+| Patient AI | `patient` | Doctor and slot selection, booking and cancellation requests, own appointment and billing history |
+| Doctor AI | `clinician` | Daily briefing, pending queues, calendar-week workload and appointments for assigned patients |
+| Finance AI | `staff` | Collections, expenses, balances, month and quarter comparisons, interactive INR charts, unusual expense candidates and a conditional baseline forecast |
+| Admin AI | `admin` | Existing administrative workspace with account approval, operational dashboard and authorized shared AI tools, including Finance reports |
+
+Finance reports use recorded data in IST. Forecasts require six completed months with positive recorded collections. Expense categories are available from the database. Department expense attribution and a dedicated Admin analytics agent are future work.
+
+## Project layout
+
+```text
+backend/app/ai/        Active orchestrator, tool registry and Gemini client
+backend/app/api/       Authentication, dashboards, scheduling, billing and chat
+backend/app/services/  Appointment, doctor, finance and triage logic
+backend/app/models/    SQLAlchemy models
+backend/migrations/    Alembic migrations
+backend/tests/         Backend tests
+frontend/src/          React workspaces, chat and report rendering
+frontend/tests/        Frontend tests
+```
 
 ## Required software
 
@@ -83,7 +106,7 @@ npm ci
 npm run dev -- --host 127.0.0.1
 ```
 
-Open `http://127.0.0.1:5173/`. The API is at `http://127.0.0.1:8000`; interactive documentation is at `http://127.0.0.1:8000/docs`. The frontend defaults to `http://localhost:8000/api`; set `VITE_API_URL` before starting Vite only if your API uses a different URL.
+Open `http://127.0.0.1:5173/`. The API is at `http://127.0.0.1:8000`; interactive documentation is at `http://127.0.0.1:8000/docs`. The frontend defaults to `http://localhost:8000/api`. If needed, set `VITE_API_URL=http://127.0.0.1:8000/api` in `frontend/.env.local` and restart Vite. Add the frontend origin to `CORS_ORIGINS` in `backend/.env` if using a different frontend URL.
 
 Use SQLite for each developer's local work. For a shared PostgreSQL environment, install/run PostgreSQL separately and configure each authorized developer's `DATABASE_URL` privately in their own `backend/.env` (for example, `postgresql+psycopg2://user:password@localhost:5432/hospital_management`). Do not share a local SQLite file or commit database files. Shared databases contain shared data, so coordinate before using one.
 
@@ -91,7 +114,9 @@ Use SQLite for each developer's local work. For a shared PostgreSQL environment,
 
 ## Authentication
 
-When the users table is empty, the first account registered through `POST /api/auth/register` receives the administrator role. Afterward, patient registration remains public; clinician, staff, and administrator registrations require an administrator's approval. Use `POST /api/auth/login` to obtain a bearer token, then send it as `Authorization: Bearer <token>` when calling operational, triage, or AI endpoints.
+Use **Create an account** on the sign-in page. On a fresh database, select **Administrator** for the first account and then sign in as Administrator. The first registration through `POST /api/auth/register` automatically becomes an approved administrator. A fresh install contains no seeded accounts or patients. After the first registration, patients can register and sign in immediately. Doctor, Finance staff, and administrator registrations require review in **Accounts** by an existing administrator.
+
+To try the booking workflow, register and approve a doctor, sign in as that doctor to configure availability, then register a patient and request a slot. Use synthetic records in local development. For direct API calls, use `POST /api/auth/login` and send the returned token as `Authorization: Bearer <token>`.
 
 Set a strong `JWT_SECRET_KEY` before sharing the environment or deploying it.
 
@@ -105,6 +130,8 @@ The AI chat endpoint now returns structured responses and maintains conversation
 history separately for each authenticated user and conversation ID:
 
 - `POST /api/ai/chat`
+- `GET /api/ai/conversations/latest`
+- `POST /api/ai/conversations/{conversation_id}/cancellation-selection`
 - `POST /api/ai/approvals/{approval_id}/approve`
 - `POST /api/ai/approvals/{approval_id}/reject`
 - `DELETE /api/ai/conversations/{conversation_id}`
@@ -124,8 +151,9 @@ explicit user confirmation.
 Implemented approval actions:
 
 - Create appointment
-- Cancel appointment
+- Request cancellation, then approve or reject it from the doctor's request queue
 - Reschedule appointment
+- Generate a bill or record a payment through AI
 
 Conversation messages and approvals are stored per authenticated user.
 The API isolates arbitrary conversation IDs, rejects cross-user approval
@@ -203,9 +231,22 @@ Set-Location backend
 
 ```powershell
 Set-Location frontend
+npm test
 npm run lint
 npm run build
 ```
+
+The lint script uses Oxlint. If an API feature works in tests but the browser
+finds an older route or tool, restart Uvicorn from the current checkout. For
+database errors, check the working directory and `DATABASE_URL`, then run
+`python -m alembic current` and `python -m alembic heads`. If Vite cannot
+reach the API, verify the URL includes `/api` and the frontend origin is allowed.
+For Windows activation errors, use the process-scoped execution policy above,
+or invoke `backend\.venv\Scripts\python.exe` directly.
+
+`HOSPITAL_TIMEZONE` controls relative booking dates where named timezone data
+is available. Without it, the backend falls back to the machine's local
+calendar when the configured zone cannot be loaded.
 
 ## Security
 

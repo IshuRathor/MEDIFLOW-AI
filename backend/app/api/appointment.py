@@ -19,6 +19,7 @@ from app.core.security import get_current_user, get_linked_doctor
 from app.models.user import User
 from pydantic import BaseModel, Field
 from app.api.availability import generate_slots, _datetime_naive
+from app.services.cancellation import PENDING_CANCELLATION, ensure_can_cancel, ensure_no_cancellation, unchanged_appointment
 
 
 router = APIRouter(
@@ -28,6 +29,11 @@ router = APIRouter(
 
 
 class DeclineAppointmentRequest(BaseModel):
+    reason: str | None = Field(default=None, max_length=500)
+
+
+class CancellationDecision(BaseModel):
+    request_id: str = Field(min_length=1, max_length=64)
     reason: str | None = Field(default=None, max_length=500)
 
 
@@ -335,13 +341,16 @@ def update_appointment(
         owned_patient = db.query(Patient).filter(Patient.user_id == current_user.id).first()
         if not owned_patient or appointment.patient_id != owned_patient.id:
             raise HTTPException(status_code=403, detail="You can only change your own appointments")
-        raise HTTPException(status_code=403, detail="Patients can cancel appointments but cannot change appointment status")
+        raise HTTPException(status_code=403, detail="Patients cannot change appointment status directly")
     if current_user.role == "clinician":
         linked_doctor = get_linked_doctor(db, current_user)
         if appointment.doctor_id != linked_doctor.id:
             raise HTTPException(status_code=403, detail="You can only change your own appointments")
         if appointment.status == "Pending Doctor Approval":
             raise HTTPException(status_code=409, detail="Use the appointment request accept or decline action")
+    ensure_no_cancellation(appointment)
+    if status == "Cancelled":
+        ensure_can_cancel(appointment)
 
     # --------------------------------------------------------
     # Validate appointment date
@@ -444,12 +453,17 @@ def update_appointment(
     # UPDATE APPOINTMENT
     # --------------------------------------------------------
 
-    appointment.appointment_date = appointment_datetime
-    appointment.status = status
-    appointment.reason = reason
-    appointment.notes = notes
-    if status != "Declined":
-        appointment.decline_reason = None
+    changed = db.execute(
+        update(Appointment).where(*unchanged_appointment(appointment)).values(
+            appointment_date=appointment_datetime,
+            status=status,
+            reason=reason,
+            notes=notes,
+            decline_reason=appointment.decline_reason if status == "Declined" else None,
+        )
+    )
+    if changed.rowcount != 1:
+        raise HTTPException(status_code=409, detail="This appointment changed. Refresh and try again.")
 
     db.commit()
     db.refresh(appointment)
@@ -483,6 +497,8 @@ def cancel_appointment(
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
+    if current_user.role == "patient":
+        raise HTTPException(status_code=403, detail="Use Ask MediFlow AI to request cancellation")
     appointment = db.query(Appointment).filter(
         Appointment.id == appointment_id
     ).first()
@@ -492,17 +508,17 @@ def cancel_appointment(
             status_code=404,
             detail="Appointment not found"
         )
-    if current_user.role == "patient":
-        owned_patient = db.query(Patient).filter(Patient.user_id == current_user.id).first()
-        if not owned_patient or appointment.patient_id != owned_patient.id:
-            raise HTTPException(status_code=403, detail="You can only cancel your own appointments")
     if current_user.role == "clinician":
         linked_doctor = get_linked_doctor(db, current_user)
         if appointment.doctor_id != linked_doctor.id:
             raise HTTPException(status_code=403, detail="You can only cancel your own appointments")
 
-    appointment.status = "Cancelled"
-    appointment.decline_reason = None
+    ensure_can_cancel(appointment)
+    changed = db.execute(
+        update(Appointment).where(*unchanged_appointment(appointment)).values(status="Cancelled", decline_reason=None)
+    )
+    if changed.rowcount != 1:
+        raise HTTPException(status_code=409, detail="This appointment changed. Refresh and try again.")
 
     db.commit()
     db.refresh(appointment)
@@ -512,6 +528,46 @@ def cancel_appointment(
         "appointment_id": appointment.id,
         "status": appointment.status
     }
+
+
+@router.post("/{appointment_id}/cancellation/{decision}")
+def decide_cancellation(
+    appointment_id: int,
+    decision: Literal["approve", "reject"],
+    payload: CancellationDecision,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    if current_user.role not in ("admin", "clinician"):
+        raise HTTPException(status_code=403, detail="Doctor or administrator access is required")
+    appointment = db.get(Appointment, appointment_id)
+    if not appointment:
+        raise HTTPException(status_code=404, detail="Appointment not found")
+    if current_user.role == "clinician" and appointment.doctor_id != get_linked_doctor(db, current_user).id:
+        raise HTTPException(status_code=403, detail="You can only process your own cancellation requests")
+
+    approved = decision == "approve"
+    conditions = [
+        Appointment.id == appointment.id,
+        Appointment.doctor_id == appointment.doctor_id,
+        Appointment.status == "Scheduled",
+        Appointment.cancellation_request_id == payload.request_id,
+        Appointment.cancellation_status == PENDING_CANCELLATION,
+    ]
+    if approved:
+        conditions.append(Appointment.appointment_date > datetime.now())
+    result_status = "Approved" if approved else "Rejected"
+    changed = db.execute(
+        update(Appointment).where(*conditions).values(
+            status="Cancelled" if approved else "Scheduled",
+            cancellation_status=result_status,
+            cancellation_reason=None if approved else (payload.reason or "").strip() or None,
+        ).execution_options(synchronize_session=False)
+    )
+    if changed.rowcount != 1:
+        raise HTTPException(status_code=409, detail="The request was already processed, or the appointment time has passed")
+    db.commit()
+    return {"status": result_status}
 
 
 def _owned_pending_appointment(db: Session, appointment_id: int, current_user: User):

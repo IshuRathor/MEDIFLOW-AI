@@ -3,25 +3,46 @@ import secrets
 import re
 import logging
 from decimal import Decimal
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
+import os
 
 from google.genai import types
 from sqlalchemy import func
 from sqlalchemy.orm import Session
 
-from app.agents.main_agent import client
+from app.ai.gemini_client import client
 from app.ai.tool_registry import ToolRegistry
 from app.models.ai import AIApproval, AIConversationMessage
 from app.models.appointment import Appointment, ACTIVE_APPOINTMENT_STATUSES
 from app.models.availability import DoctorAvailability
 from app.models.doctor import Doctor
-from app.models.finance import Bill, Expense, Payment
+from app.models.finance import Bill, Payment
 from app.models.patient import Patient
 from app.services.triage_service import triage_patient
+from app.services.cancellation import REQUEST_CANCELLATION, cancellation_choices, cancellation_intent
+from app.services.doctor_intelligence import (
+    doctor_daily_briefing, doctor_intelligence_call, doctor_patient_timeline, doctor_weekly_workload,
+)
+from app.services.finance_analytics import FINANCE_ROLES, bill_balances, finance_analytics, finance_intent, recorded_total
 from app.api.availability import generate_slots
 
 
 MAX_HISTORY_MESSAGES = 20
 MAX_TOOL_CALLS = 6
+DOCTOR_INTELLIGENCE_TOOLS = {"doctor_daily_briefing", "doctor_weekly_workload", "doctor_patient_timeline"}
+EMERGENCY_TERMS = (
+    "severe chest pain",
+    "difficulty breathing",
+    "can't breathe",
+    "cannot breathe",
+    "unconscious",
+    "loss of consciousness",
+    "severe bleeding",
+    "heavy bleeding",
+    "stroke",
+    "seizure",
+    "convulsion",
+)
 logger = logging.getLogger(__name__)
 
 
@@ -202,72 +223,46 @@ def _appointment_history(
     }
 
 
+def _finance_dates(start_date, end_date):
+    start = datetime.strptime(start_date, "%Y-%m-%d").date() if start_date else None
+    end = datetime.strptime(end_date, "%Y-%m-%d").date() + timedelta(days=1) if end_date else None
+    if start and end and start >= end:
+        raise ValueError("The start date must be on or before the end date.")
+    return start, end
+
+
 def _financial_summary(db: Session, user, start_date: str | None = None, end_date: str | None = None):
-    payment_query = db.query(Payment).filter(Payment.payment_status == "Completed")
-    expense_query = db.query(Expense)
-
-    if start_date:
-        try:
-            start = datetime.strptime(start_date, "%Y-%m-%d")
-        except ValueError:
-            return {"status": "error", "message": "start_date must use YYYY-MM-DD format"}
-        payment_query = payment_query.filter(Payment.paid_at >= start)
-        expense_query = expense_query.filter(Expense.expense_date >= start.date())
-    if end_date:
-        try:
-            end = datetime.strptime(end_date, "%Y-%m-%d") + timedelta(days=1)
-        except ValueError:
-            return {"status": "error", "message": "end_date must use YYYY-MM-DD format"}
-        payment_query = payment_query.filter(Payment.paid_at < end)
-        expense_query = expense_query.filter(Expense.expense_date < end.date())
-
-    revenue = float(payment_query.with_entities(func.coalesce(func.sum(Payment.amount), 0)).scalar() or 0)
-    expenses = float(expense_query.with_entities(func.coalesce(func.sum(Expense.amount), 0)).scalar() or 0)
-    pending = db.query(Bill).filter(Bill.status.in_(("Pending", "Partially Paid"))).all()
-    pending_amount = Decimal("0")
-    for bill in pending:
-        completed = db.query(func.coalesce(func.sum(Payment.amount), 0)).filter(
-            Payment.bill_id == bill.id,
-            Payment.payment_status == "Completed",
-        ).scalar()
-        outstanding = Decimal(str(bill.total_amount)) - Decimal(str(completed or 0))
-        pending_amount += max(outstanding, Decimal("0"))
-
+    try:
+        start, end = _finance_dates(start_date, end_date)
+    except (ValueError, OverflowError) as error:
+        return {"status": "error", "message": str(error)}
+    collections = recorded_total(db, start, end)
+    expenses = recorded_total(db, start, end, expenses=True)
     return {
         "status": "success",
-        "revenue": revenue,
-        "expenses": expenses,
-        "net_income": revenue - expenses,
-        "pending_amount": float(pending_amount),
+        "revenue": float(collections),
+        "expenses": float(expenses),
+        "financial_movement": float(collections - expenses),
+        "pending_amount": float(bill_balances(db)["outstanding"]),
         "currency": "INR",
     }
 
 
 def _monthly_comparison(db: Session, user):
-    now = datetime.now()
-    current_start = now.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
-    previous_start = (current_start - timedelta(days=1)).replace(day=1)
-
-    def revenue(start: datetime, end: datetime) -> float:
-        value = db.query(func.coalesce(func.sum(Payment.amount), 0)).filter(
-            Payment.payment_status == "Completed",
-            Payment.paid_at >= start,
-            Payment.paid_at < end,
-        ).scalar()
-        return float(value or 0)
-
-    current = revenue(current_start, now)
-    previous = revenue(previous_start, current_start)
-    difference = current - previous
-    percent = (difference / previous * 100) if previous else None
-
+    result = finance_analytics(db, user, view="month_comparison")
+    if result.get("status") == "error":
+        return result
+    report = result["finance_report"]
+    current, previous = (Decimal(value) for value in report["charts"][0]["series"][0]["values"])
+    percent = report["metrics"][1]["value"]
     return {
         "status": "success",
-        "current_month_revenue": current,
-        "previous_month_revenue": previous,
-        "difference": difference,
-        "percent_change": percent,
+        "current_month_revenue": float(current),
+        "previous_month_revenue": float(previous),
+        "difference": float(current - previous),
+        "percent_change": float(percent) if percent is not None else None,
         "currency": "INR",
+        "comparable_days": True,
     }
 
 
@@ -307,21 +302,12 @@ def _pending_bills(db: Session, user):
 
 
 def _expense_summary(db: Session, user, start_date: str | None = None, end_date: str | None = None):
-    query = db.query(Expense)
-    if start_date:
-        try:
-            start = datetime.strptime(start_date, "%Y-%m-%d").date()
-        except ValueError:
-            return {"status": "error", "message": "start_date must use YYYY-MM-DD format"}
-        query = query.filter(Expense.expense_date >= start)
-    if end_date:
-        try:
-            end = datetime.strptime(end_date, "%Y-%m-%d").date()
-        except ValueError:
-            return {"status": "error", "message": "end_date must use YYYY-MM-DD format"}
-        query = query.filter(Expense.expense_date <= end)
-    total = float(query.with_entities(func.coalesce(func.sum(Expense.amount), 0)).scalar() or 0)
-    return {"status": "success", "expenses": total, "currency": "INR"}
+    try:
+        start, end = _finance_dates(start_date, end_date)
+    except (ValueError, OverflowError) as error:
+        return {"status": "error", "message": str(error)}
+    total = recorded_total(db, start, end, expenses=True)
+    return {"status": "success", "expenses": float(total), "currency": "INR"}
 
 
 def _payment_history(db: Session, user, bill_id: int | None = None, limit: int = 20):
@@ -353,20 +339,123 @@ def _payment_history(db: Session, user, bill_id: int | None = None, limit: int =
     }
 
 
-def _support_guidance(db: Session, user, category: str = "general", issue: str = ""):
-    if category == "appointment":
-        message = "Provide the appointment ID or describe the doctor, date and patient involved."
-    elif category == "billing":
-        message = "Provide the bill number or bill ID so the relevant billing record can be checked."
-    elif category == "technical":
-        message = "Describe the screen, operation and exact error message you encountered."
-    else:
-        message = "Please describe the hospital, appointment, billing, payment or technical issue."
-    return {
-        "status": "clarification_required",
-        "category": category,
-        "message": message,
+def _support_intent_category(query: str) -> str | None:
+    lowered = query.lower()
+    words = set(re.findall(r"[a-z']+", lowered))
+    guidance_cues = {
+        "help", "how", "guide", "guidance", "trouble", "problem", "issue",
+        "can't", "cannot", "unable", "where", "navigate", "support",
     }
+
+    if any(term in lowered for term in (
+        "talk to a person", "talk to a human", "speak to a human", "connect me to a human",
+        "need a human", "human support", "contact support", "contact an administrator", "escalate",
+    )):
+        return "human_escalation"
+    if words.intersection({"login", "log", "password", "register", "registration", "signup", "sign", "account", "otp"}) and (
+        words.intersection(guidance_cues | {"pending", "approval", "locked", "blocked", "rejected", "reset", "forgot"})
+        or words.intersection({"login", "register", "registration", "signup", "password", "otp"})
+        or "can't sign in" in lowered
+    ):
+        return "login_registration"
+    if "dashboard" in words or ("overview" in words and words.intersection(guidance_cues)):
+        return "dashboard_navigation"
+    if words.intersection({"technical", "error", "crash", "freeze", "broken"}) or "not working" in lowered:
+        return "technical_support"
+    if "availability" in words or "available" in words or ("schedule" in words and words.intersection({"doctor", "dr"})):
+        if words.intersection(guidance_cues) or "is dr" in lowered or "is doctor" in lowered:
+            return "doctor_availability"
+    if words.intersection({"cancel", "cancellation"}) and words.intersection(guidance_cues):
+        return "appointment_cancellation"
+    if "appointment" in words or "booking" in words or "book" in words:
+        if words.intersection({"status", "pending", "accepted", "declined", "confirmed", "check"}):
+            return "appointment_status"
+        if words.intersection({"book", "booking"}) and words.intersection(guidance_cues):
+            return "appointment_booking"
+        if "appointment" in words and words.intersection(guidance_cues):
+            return "appointment_support"
+    if words.intersection({"billing", "bill", "payment", "refund", "charge"}) and words.intersection(guidance_cues):
+        return "billing_support"
+    if "mediflow" in words or words.intersection({"system", "hospital", "help", "support", "complaint"}):
+        return "general_system"
+    return None
+
+
+def _support_guidance(db: Session, user, category: str = "general", issue: str = ""):
+    """Give workflow guidance only; all live records remain behind scoped tools."""
+    category = _support_intent_category(issue) or category
+    category = {
+        "appointment": "appointment_support",
+        "technical": "technical_support",
+        "billing": "billing_support",
+        "general": "general_system",
+    }.get(category, category)
+    role = getattr(user, "role", "")
+    messages = {
+        "general_system": (
+            "I can guide you around the MEDIFLOW workspace and its available hospital workflows. "
+            "Ask a specific question about appointments, doctors, account access, or your dashboard."
+        ),
+        "dashboard_navigation": "Your available dashboard sections depend on your signed-in role.",
+        "appointment_support": (
+            "I can guide you with booking, checking, or cancelling an appointment. For a live status, ask me to "
+            "show your appointments; for a booking or cancellation, tell me what you want to do and review the confirmation."
+        ),
+        "appointment_booking": (
+            "To request an appointment, tell me a doctor's name or specialty and your preferred date and time. "
+            "I will check the recorded availability, show you a summary, and wait for your confirmation. "
+            "A patient request remains pending until the doctor accepts it."
+        ),
+        "appointment_status": (
+            "I won't guess an appointment's status. Ask me to show your appointments, or refresh the "
+            "Appointments section of your role dashboard to see the status recorded for your account."
+        ),
+        "appointment_cancellation": (
+            "To request a cancellation, provide the appointment number and ask me to cancel it. "
+            "Review and confirm the cancellation request when prompted; I won't change an appointment from guidance alone."
+        ),
+        "doctor_availability": (
+            "Availability comes from the schedule on file. Tell me the doctor's name or specialty and a date; "
+            "I can check the actual open slots recorded for that date."
+        ),
+        "login_registration": (
+            "Check that you selected the correct account role and entered the email used during registration. "
+            "Patient accounts can register through the sign-up page; clinician and staff accounts require administrator approval. "
+            "This workspace does not offer a self-service password reset. Never share your password or one-time code. "
+            "For a pending, locked, or inaccessible account, contact your hospital administrator through a verified channel."
+        ),
+        "technical_support": (
+            "Please share the page, action, and exact error text (with personal or medical details removed). "
+            "You can try refreshing the page and signing in again. If the problem continues, contact your hospital's "
+            "support desk or administrator through a verified channel; do not share passwords or one-time codes."
+        ),
+        "billing_support": (
+            "I can explain where to review billing information, but I won't guess a bill or payment status. "
+            "Patients can review their own bills in the patient dashboard; finance staff can use Billing. "
+            "For a disputed charge or payment that needs correction, contact finance staff through your hospital's verified channel."
+        ),
+        "human_escalation": (
+            "This needs help from a person. Please contact your hospital support desk or administrator through a verified "
+            "channel and share the issue without sending passwords, one-time codes, or unnecessary patient details."
+        ),
+    }
+    role_messages = {
+        "patient": " For your own records, use the Patient Overview and Appointments sections.",
+        "clinician": " Use your clinician Overview and Appointments sections for your requests and assigned patients.",
+        "staff": " Use Overview, Appointments, and Billing for the staff workflows available to your account.",
+        "admin": " Use Overview and Accounts for administrator workflows; access remains subject to your account permissions.",
+    }
+    message = messages.get(category)
+    if message is None:
+        return {
+            "status": "clarification_required",
+            "category": "unknown",
+            "message": "I’m not sure which part of MEDIFLOW you need help with. Is it appointments, doctor availability, account access, dashboard navigation, billing, or a technical problem?",
+        }
+    if category in {"appointment_status", "appointment_cancellation", "doctor_availability", "dashboard_navigation"}:
+        message += role_messages.get(role, "")
+    status = "clarification_required" if category == "appointment_support" else "success"
+    return {"status": status, "category": category, "message": message}
 
 
 def _conversation_history(db: Session, user_id: int, conversation_id: str) -> list[dict]:
@@ -409,11 +498,43 @@ WEEKDAYS = {
 
 
 def _extract_date(text: str) -> str | None:
-    explicit = re.search(r"\b(20\d{2}-\d{2}-\d{2})\b", text)
+    explicit = re.search(r"\b(20\d{2}-\d{1,2}-\d{1,2})\b", text)
     if explicit:
-        return explicit.group(1)
+        try:
+            return datetime.strptime(explicit.group(1), "%Y-%m-%d").date().isoformat()
+        except ValueError:
+            return None
+    numeric = re.search(r"\b(\d{1,2})[/.\-](\d{1,2})[/.\-](20\d{2})\b", text)
+    if numeric:
+        first, second, year = map(int, numeric.groups())
+        if first <= 12 and second <= 12:
+            return None  # Ambiguous numeric date; ask the patient to clarify.
+        day, month = (first, second) if first > 12 else (second, first)
+        try:
+            return datetime(year, month, day).date().isoformat()
+        except ValueError:
+            return None
+    for pattern, fmt in (
+        (r"\b([A-Za-z]+)\s+(\d{1,2}),?\s+(20\d{2})\b", "%B %d %Y"),
+        (r"\b(\d{1,2})\s+([A-Za-z]+)\s+(20\d{2})\b", "%d %B %Y"),
+    ):
+        written = re.search(pattern, text)
+        if written:
+            normalized = " ".join(written.groups())
+            try:
+                return datetime.strptime(normalized, fmt).date().isoformat()
+            except ValueError:
+                try:
+                    short_fmt = fmt.replace("%B", "%b")
+                    return datetime.strptime(normalized, short_fmt).date().isoformat()
+                except ValueError:
+                    return None
     lowered = text.lower()
-    today = datetime.now().date()
+    timezone_name = os.getenv("HOSPITAL_TIMEZONE", "Asia/Kolkata")
+    try:
+        today = datetime.now(ZoneInfo(timezone_name)).date()
+    except ZoneInfoNotFoundError:
+        today = datetime.now().date()
     if "today" in lowered:
         return today.isoformat()
     if "tomorrow" in lowered:
@@ -427,10 +548,25 @@ def _extract_date(text: str) -> str | None:
     return None
 
 
+def _has_ambiguous_numeric_date(text: str) -> bool:
+    match = re.search(r"\b(\d{1,2})[/.\-](\d{1,2})[/.\-](20\d{2})\b", text)
+    return bool(match and int(match.group(1)) <= 12 and int(match.group(2)) <= 12)
+
+
 def _extract_time(text: str) -> str | None:
-    match = re.search(r"\b([01]?\d|2[0-3]):([0-5]\d)\b", text)
+    match = re.search(r"\b([01]?\d|2[0-3]):([0-5]\d)\s*(am|pm)?\b", text.lower())
     if match:
-        return f"{int(match.group(1)):02d}:{match.group(2)}"
+        hour = int(match.group(1))
+        minute = int(match.group(2))
+        meridiem = match.group(3)
+        if meridiem:
+            if hour > 12 or hour == 0:
+                return None
+            if meridiem == "pm" and hour != 12:
+                hour += 12
+            elif meridiem == "am" and hour == 12:
+                hour = 0
+        return f"{hour:02d}:{minute:02d}"
     match = re.search(r"\b([01]?\d)(?:\s*:\s*([0-5]\d))?\s*(am|pm)\b", text.lower())
     if match:
         hour = int(match.group(1))
@@ -440,6 +576,9 @@ def _extract_time(text: str) -> str | None:
         if match.group(3) == "am" and hour == 12:
             hour = 0
         return f"{hour:02d}:{minute:02d}"
+    match = re.search(r"\b(\d{1,2})\s*(?:o'clock|oclock)\b", text.lower())
+    if match and int(match.group(1)) < 24:
+        return f"{int(match.group(1)):02d}:00"
     return None
 
 
@@ -477,7 +616,7 @@ def _resolve_doctor(db: Session, text: str):
     return None
 
 
-def _create_pending_approval(db: Session, user, conversation_id: str, action: str, parameters: dict):
+def _create_pending_approval(db: Session, user, conversation_id: str, action: str, parameters: dict, *, commit=True):
     approval = AIApproval(
         id=secrets.token_urlsafe(24),
         conversation_id=conversation_id,
@@ -488,7 +627,8 @@ def _create_pending_approval(db: Session, user, conversation_id: str, action: st
         expires_at=datetime.now(timezone.utc) + timedelta(minutes=10),
     )
     db.add(approval)
-    db.commit()
+    if commit:
+        db.commit()
     return approval
 
 
@@ -548,6 +688,40 @@ def _proposal_create_appointment(db: Session, user, patient_id: int, doctor_id: 
 
 def _build_registry() -> ToolRegistry:
     registry = ToolRegistry()
+    registry.register(
+        "finance_analytics", "Read authorized INR finance reports. Views: collections, expenses, categories, balances, performance, month_comparison, quarter_comparison, unusual, forecast.",
+        FINANCE_ROLES, finance_analytics,
+        {
+            "type": "object",
+            "properties": {
+                "view": {"type": "string"}, "grain": {"type": "string"}, "months": {"type": "integer"},
+                "start_date": {"type": "string"}, "end_date": {"type": "string"},
+            },
+            "required": [],
+        },
+    )
+    registry.register(
+        "doctor_daily_briefing", "Read the signed-in doctor's schedule, completed visits, and request queues.",
+        ("clinician",), doctor_daily_briefing,
+        {"type": "object", "properties": {"view": {"type": "string"}}, "required": []},
+    )
+    registry.register(
+        "doctor_weekly_workload", "Compare the signed-in doctor's scheduled, completed and cancelled appointments by week.",
+        ("clinician",), doctor_weekly_workload,
+        {"type": "object", "properties": {}, "required": []},
+    )
+    registry.register(
+        "doctor_patient_timeline", "List assigned patients or read previous appointments with one assigned patient.",
+        ("clinician",), doctor_patient_timeline,
+        {
+            "type": "object",
+            "properties": {
+                "patient_id": {"type": "integer"}, "patient_name": {"type": "string"},
+                "list_patients": {"type": "boolean"},
+            },
+            "required": [],
+        },
+    )
     registry.register(
         "support_guidance",
         "Classify and request missing details for hospital support issues.",
@@ -799,7 +973,8 @@ def _build_registry() -> ToolRegistry:
 REGISTRY = _build_registry()
 
 
-def _gemini_declarations():
+def _gemini_declarations(user_role: str | None = None):
+    patient_hidden_tools = {"get_patient", "doctor_availability", "find_available_slots", "create_appointment"}
     return [
         types.FunctionDeclaration(
             name=schema["name"],
@@ -819,11 +994,14 @@ def _gemini_declarations():
                         ),
                     )
                     for name, specification in schema["parameters"]["properties"].items()
+                    if not (schema["name"] == "doctor_patient_timeline" and name == "patient_id")
                 },
                 required=schema["parameters"]["required"],
             ),
         )
         for schema in REGISTRY.schemas()
+        if not (user_role == "patient" and schema["name"] in patient_hidden_tools)
+        and (user_role is None or user_role in REGISTRY.get(schema["name"]).allowed_roles)
     ]
 
 
@@ -846,7 +1024,7 @@ def _function_calls(response):
     return calls or []
 
 
-def _gemini_response(query: str, history: list[dict], tool_results: list[dict] | None = None):
+def _gemini_response(query: str, history: list[dict], tool_results: list[dict] | None = None, user_role: str | None = None):
     if client is None:
         raise RuntimeError("Gemini is not configured")
     context = "\n".join(
@@ -874,7 +1052,7 @@ def _gemini_response(query: str, history: list[dict], tool_results: list[dict] |
         config=types.GenerateContentConfig(
             temperature=0,
             max_output_tokens=512,
-            tools=[types.Tool(function_declarations=_gemini_declarations())],
+            tools=[types.Tool(function_declarations=_gemini_declarations(user_role))],
         ),
     )
 
@@ -950,7 +1128,9 @@ def _patient_appointment_conversation(db: Session, user, conversation_id: str, q
         phrase in history[-1].get("content", "").lower()
         for phrase in ("choose a doctor", "what date", "what time", "which time", "choose one of these times", "choose another date", "reason for this appointment", "tell me the time")
     ))
-    search_only = not continuing_booking and not any(word in query.lower() for word in ("book", "schedule", "request", "slot", "availability"))
+    search_only = not continuing_booking and not any(word in query.lower() for word in (
+        "book", "schedule", "request", "appointment", "visit", "arrange", "consult", "slot", "availability",
+    ))
     if search_only:
         doctors = [doctor_result] if doctor_result and not isinstance(doctor_result, tuple) else (doctor_result[1] if isinstance(doctor_result, tuple) else db.query(Doctor).order_by(Doctor.name.asc()).limit(100).all())
         rows = []
@@ -999,9 +1179,23 @@ def _patient_appointment_conversation(db: Session, user, conversation_id: str, q
             "conversation_id": conversation_id,
             "agent": "Hospital Operations Agent",
             "status": "clarification_required",
-            "message": "Choose a doctor from the real doctor directory below. Availability shown is the schedule on file; tell me your preferred date to check open slots.",
+            "message": (
+                "Choose a doctor below. Then tell me your preferred date and I will check open appointment times."
+                if rows else "There are currently no doctors in the directory. Please contact the clinic for help booking an appointment."
+            ),
             "data": {"doctors": rows},
             "trace": [{"tool": "search_doctors", "status": "success", "duration_ms": 0}],
+            "approval_id": None,
+        }
+
+    if (_has_ambiguous_numeric_date(query) or _has_ambiguous_numeric_date(context)) and not _extract_date(query):
+        return {
+            "conversation_id": conversation_id,
+            "agent": "Hospital Operations Agent",
+            "status": "clarification_required",
+            "message": "That date could mean two different days. Please spell out the month or use an unambiguous date such as 25/11/2026 or 2026-11-25.",
+            "data": {"doctor": {"name": doctor_result.name}},
+            "trace": [],
             "approval_id": None,
         }
 
@@ -1017,11 +1211,33 @@ def _patient_appointment_conversation(db: Session, user, conversation_id: str, q
             "approval_id": None,
         }
 
+    target_day = datetime.strptime(target_date, "%Y-%m-%d").date()
+    timezone_name = os.getenv("HOSPITAL_TIMEZONE", "Asia/Kolkata")
+    try:
+        hospital_today = datetime.now(ZoneInfo(timezone_name)).date()
+    except ZoneInfoNotFoundError:
+        hospital_today = datetime.now().date()
+    if target_day < hospital_today:
+        return {
+            "conversation_id": conversation_id,
+            "agent": "Hospital Operations Agent",
+            "status": "clarification_required",
+            "message": "That date has already passed. Please choose a future date.",
+            "data": {"doctor": {"name": doctor_result.name}},
+            "trace": [],
+            "approval_id": None,
+        }
+
     target_time = _extract_time(query) or _extract_time(context)
-    slot_result = generate_slots(db, doctor_result.id, datetime.strptime(target_date, "%Y-%m-%d").date())
+    slot_result = generate_slots(db, doctor_result.id, target_day)
+    timezone_name = os.getenv("HOSPITAL_TIMEZONE", "Asia/Kolkata")
+    try:
+        hospital_now = datetime.now(ZoneInfo(timezone_name)).replace(tzinfo=None)
+    except ZoneInfoNotFoundError:
+        hospital_now = datetime.now()
     available_slots = [
         slot for slot in slot_result["slots"]
-        if slot["status"] == "available" and datetime.fromisoformat(slot["start"]) > datetime.now()
+        if slot["status"] == "available" and datetime.fromisoformat(slot["start"]) > hospital_now
     ]
     if slot_result["blocked"]:
         return {
@@ -1030,6 +1246,16 @@ def _patient_appointment_conversation(db: Session, user, conversation_id: str, q
             "status": "clarification_required",
             "message": f"Dr. {doctor_result.name} has blocked {target_date}. Available dates: {', '.join(slot_result['alternatives']) or 'none currently listed'}. Choose another date.",
             "data": {"alternatives": slot_result["alternatives"]}, "trace": [], "approval_id": None,
+        }
+    if not available_slots:
+        return {
+            "conversation_id": conversation_id,
+            "agent": "Hospital Operations Agent",
+            "status": "clarification_required",
+            "message": f"Dr. {doctor_result.name} has no open slots on {target_date}. Available alternative dates: {', '.join(slot_result['alternatives']) or 'none currently listed'}. Choose another date or doctor.",
+            "data": {"doctor": {"name": doctor_result.name}, "date": target_date, "alternatives": slot_result["alternatives"]},
+            "trace": [{"tool": "find_available_slots", "status": "success", "duration_ms": 0}],
+            "approval_id": None,
         }
     if not target_time:
         available = [datetime.fromisoformat(slot["start"]).strftime("%I:%M %p").lower() for slot in available_slots]
@@ -1058,15 +1284,6 @@ def _patient_appointment_conversation(db: Session, user, conversation_id: str, q
         reason = query.strip(" .,!?")
     if reason and reason.lower() in {"tomorrow", "today", "monday", "tuesday", "wednesday", "thursday", "friday", "saturday", "sunday"}:
         reason = None
-    if not reason:
-        return {
-            "conversation_id": conversation_id,
-            "agent": "Hospital Operations Agent",
-            "status": "clarification_required",
-            "message": "What is the reason for this appointment?",
-            "data": {"doctor": {"id": doctor_result.id, "name": doctor_result.name}, "date": target_date, "time": target_time},
-            "trace": [], "approval_id": None,
-        }
     patient = db.query(Patient).filter(Patient.user_id == user.id).first()
     if not patient:
         return {"conversation_id": conversation_id, "agent": "Hospital Operations Agent", "status": "error", "message": "No patient profile is linked to this account.", "data": {}, "trace": [], "approval_id": None}
@@ -1141,6 +1358,8 @@ def _determine_write_action(db: Session, user, conversation_id: str, name: str, 
             "payment_method": str(arguments["payment_method"]),
         })
     if name == "cancel_appointment":
+        if user.role == "patient":
+            return _patient_cancellation_choices(db, user, conversation_id)
         appointment_id = arguments.get("appointment_id")
         if not isinstance(appointment_id, int):
             return None
@@ -1311,7 +1530,36 @@ def _determine_write_action(db: Session, user, conversation_id: str, name: str, 
     return None
 
 
-def run_orchestrator(db: Session, user, query: str, conversation_id: str | None = None) -> dict:
+def _patient_cancellation_choices(db, user, conversation_id, doctor_filter=None):
+    return {
+        "conversation_id": conversation_id,
+        "agent": "Hospital Operations Agent",
+        "trace": [],
+        "approval_id": None,
+        **cancellation_choices(db, user, doctor_filter),
+    }
+
+
+def _has_cancellation_picker(db, user, conversation_id, history):
+    latest = db.query(AIConversationMessage.trace_json).filter(
+        AIConversationMessage.user_id == user.id,
+        AIConversationMessage.conversation_id == conversation_id,
+        AIConversationMessage.role == "assistant",
+    ).order_by(AIConversationMessage.created_at.desc(), AIConversationMessage.id.desc()).first()
+    metadata = latest.trace_json if latest and isinstance(latest.trace_json, dict) else {}
+    if metadata.get("restore", {}).get("data", {}).get("cancellation_picker"):
+        return True
+    # Recover conversations that reached the old doctor lookup fallback.
+    return (
+        len(history) >= 2
+        and history[-1]["role"] == "assistant"
+        and history[-1]["content"].startswith("I could not find that doctor.")
+        and history[-2]["role"] == "user"
+        and cancellation_intent(history[-2]["content"])
+    )
+
+
+def run_orchestrator(db: Session, user, query: str, conversation_id: str | None = None, doctor_patient_id: int | None = None) -> dict:
     conversation_id = conversation_id or secrets.token_urlsafe(18)
     if conversation_id:
         foreign_owner = (
@@ -1335,18 +1583,19 @@ def run_orchestrator(db: Session, user, query: str, conversation_id: str | None 
     history = _conversation_history(db, user.id, conversation_id)
     _store_message(db, user.id, conversation_id, "user", query)
 
-    confirmation = query.strip().lower()
-    if confirmation in {"yes", "confirm", "book it", "yes please", "please confirm"}:
-        pending = (
-            db.query(AIApproval)
-            .filter(
-                AIApproval.conversation_id == conversation_id,
-                AIApproval.user_id == user.id,
-                AIApproval.status == "pending",
-            )
-            .order_by(AIApproval.created_at.desc())
-            .first()
+    lowered = query.lower()
+    is_emergency = any(term in lowered for term in EMERGENCY_TERMS)
+    confirmation = lowered.strip()
+    is_confirmation = confirmation in {"yes", "confirm", "book it", "yes please", "please confirm"}
+    if not is_emergency and (is_confirmation or user.role == "patient"):
+        approvals = db.query(AIApproval).filter(
+            AIApproval.conversation_id == conversation_id,
+            AIApproval.user_id == user.id,
+            AIApproval.status == "pending",
         )
+        if not is_confirmation:
+            approvals = approvals.filter(AIApproval.action == REQUEST_CANCELLATION)
+        pending = approvals.order_by(AIApproval.created_at.desc(), AIApproval.id.desc()).first()
         if pending:
             expires_at = pending.expires_at
             if expires_at.tzinfo is None:
@@ -1358,10 +1607,26 @@ def run_orchestrator(db: Session, user, query: str, conversation_id: str | None 
                     "conversation_id": conversation_id,
                     "agent": "Hospital Operations Agent",
                     "status": "error",
-                    "message": "The pending confirmation has expired. Please start the booking again.",
+                    "message": (
+                        "The cancellation confirmation has expired. Ask to cancel the appointment again."
+                        if pending.action == REQUEST_CANCELLATION
+                        else "The pending confirmation has expired. Please start the booking again."
+                    ),
                     "data": {},
                     "trace": [],
                     "approval_id": None,
+                }
+                _store_message(db, user.id, conversation_id, "assistant", response["message"])
+                return response
+            if pending.action == REQUEST_CANCELLATION:
+                response = {
+                    "conversation_id": conversation_id,
+                    "agent": "Hospital Operations Agent",
+                    "status": "approval_required",
+                    "message": "Use the confirmation button to send your cancellation request.",
+                    "data": {"cancellation_selection": pending.parameters_json["card"]},
+                    "trace": [{"tool": REQUEST_CANCELLATION, "status": "approval_required", "duration_ms": 0}],
+                    "approval_id": pending.id,
                 }
                 _store_message(db, user.id, conversation_id, "assistant", response["message"])
                 return response
@@ -1379,21 +1644,7 @@ def run_orchestrator(db: Session, user, query: str, conversation_id: str | None 
             _store_message(db, user.id, conversation_id, "assistant", response["message"])
             return response
 
-    lowered = query.lower()
-    emergency_terms = (
-        "severe chest pain",
-        "difficulty breathing",
-        "can't breathe",
-        "cannot breathe",
-        "unconscious",
-        "loss of consciousness",
-        "severe bleeding",
-        "heavy bleeding",
-        "stroke",
-        "seizure",
-        "convulsion",
-    )
-    if any(term in lowered for term in emergency_terms):
+    if is_emergency:
         triage = triage_patient(query)
         response = {
             "conversation_id": conversation_id,
@@ -1412,32 +1663,76 @@ def run_orchestrator(db: Session, user, query: str, conversation_id: str | None 
         return response
 
     if user.role == "patient":
+        starts_cancellation = cancellation_intent(query)
+        if starts_cancellation or _has_cancellation_picker(db, user, conversation_id, history):
+            response = _patient_cancellation_choices(db, user, conversation_id, None if starts_cancellation else query)
+            _store_message(db, user.id, conversation_id, "assistant", response["message"])
+            return response
+        support_intent = _support_intent_category(query)
         prior_booking = bool(history and history[-1].get("role") == "assistant" and any(
             phrase in history[-1].get("content", "").lower()
             for phrase in ("choose a doctor", "what date", "what time", "which time", "choose one of these times", "choose another date", "reason for this appointment", "tell me the time")
         ))
         query_lowered = query.lower()
         booking_or_search = (
-            any(word in query_lowered for word in ("book", "schedule", "request an appointment", "want an appointment", "need an appointment"))
+            any(phrase in query_lowered for phrase in (
+                "book", "schedule", "appointment request", "request an appointment",
+                "want an appointment", "need an appointment", "make an appointment",
+                "arrange an appointment", "arrange a visit", "book a visit",
+                "get an appointment", "appointment with", "schedule a visit",
+                "consult dr ", "consult doctor ",
+                "see dr ", "see doctor ", "visit dr ", "visit doctor ",
+            ))
             or prior_booking
             or any(word in query_lowered for word in ("alternative", "alternatives", "declined"))
             or (("find" in query_lowered or "show" in query_lowered or "search" in query_lowered) and any(word in query_lowered for word in ("doctor", "cardiologist", "dermatologist", "neurologist", "orthopedic", "cardiology")))
         )
-        if prior_booking or booking_or_search:
+        if (prior_booking or booking_or_search) and support_intent != "appointment_booking":
             response = _patient_appointment_conversation(db, user, conversation_id, query, history)
             _store_message(db, user.id, conversation_id, "assistant", response["message"], response.get("trace"))
             return response
 
-    try:
-        first_response = _gemini_response(query, history)
-        function_calls = _function_calls(first_response)
-    except Exception as exc:
-        logger.warning(
-            "gemini_request_failed conversation_id=%s error_type=%s",
-            conversation_id,
-            type(exc).__name__,
-        )
-        function_calls = []
+    doctor_call = doctor_intelligence_call(query) if user.role == "clinician" else None
+    if user.role == "clinician" and doctor_patient_id is not None:
+        doctor_call = ("doctor_patient_timeline", {"patient_id": doctor_patient_id})
+    if doctor_call == ("doctor_patient_timeline", {}):
+        latest = db.query(AIConversationMessage.trace_json).filter(
+            AIConversationMessage.user_id == user.id,
+            AIConversationMessage.conversation_id == conversation_id,
+            AIConversationMessage.role == "assistant",
+        ).order_by(AIConversationMessage.id.desc()).first()
+        metadata = latest.trace_json if latest and isinstance(latest.trace_json, dict) else {}
+        patient_id = metadata.get("restore", {}).get("data", {}).get("doctor_patient_id")
+        if patient_id is not None:
+            doctor_call = ("doctor_patient_timeline", {"patient_id": patient_id})
+
+    finance_args = finance_intent(query)
+    if user.role == "patient" and finance_args and finance_args["view"] == "balances":
+        # Keep patient billing requests on the existing own-account path.
+        finance_args = None
+    first_response = None
+    if doctor_call:
+        function_calls = [doctor_call]
+    elif finance_args:
+        function_calls = [("finance_analytics", finance_args)]
+    else:
+        try:
+            first_response = _gemini_response(query, history, user_role=user.role)
+            function_calls = _function_calls(first_response)
+        except Exception as exc:
+            logger.warning(
+                "gemini_request_failed conversation_id=%s error_type=%s",
+                conversation_id,
+                type(exc).__name__,
+            )
+            function_calls = []
+
+        support_intent = _support_intent_category(query)
+        if support_intent == "appointment_status":
+            # Status must come from the existing role-scoped appointment query.
+            function_calls = [("appointment_history", {})]
+        elif support_intent:
+            function_calls = [("support_guidance", {"category": support_intent, "issue": query})]
 
     trace = []
     tool_results = []
@@ -1631,6 +1926,10 @@ def run_orchestrator(db: Session, user, query: str, conversation_id: str | None 
                 }
                 _store_message(db, user.id, conversation_id, "assistant", response["message"])
                 return response
+        elif not function_calls and "cancel" in lowered and user.role == "patient":
+            response = _patient_cancellation_choices(db, user, conversation_id)
+            _store_message(db, user.id, conversation_id, "assistant", response["message"])
+            return response
         elif not function_calls and "cancel" in lowered:
             response = {
                 "conversation_id": conversation_id,
@@ -1673,7 +1972,7 @@ def run_orchestrator(db: Session, user, query: str, conversation_id: str | None 
         elif not function_calls:
             response = {
                 "conversation_id": conversation_id,
-                "agent": "Patient Support Agent",
+                "agent": "Customer Support Agent",
                 "status": "clarification_required",
                 "message": "Please describe whether you need hospital, billing, appointment, or technical support.",
                 "data": {"previous_context": history[-3:]},
@@ -1684,13 +1983,11 @@ def run_orchestrator(db: Session, user, query: str, conversation_id: str | None 
             return response
 
     for name, arguments in function_calls[:MAX_TOOL_CALLS]:
-        approval_response = _determine_write_action(
-            db,
-            user,
-            conversation_id,
-            name,
-            arguments,
-        )
+        tool = REGISTRY.get(name)
+        approval_response = None
+        if (tool and tool.kind == "approval_write" and user.role in tool.allowed_roles
+                and REGISTRY.validate_parameters(tool, arguments) is None):
+            approval_response = _determine_write_action(db, user, conversation_id, name, arguments)
         if approval_response:
             response = approval_response
             _store_message(db, user.id, conversation_id, "assistant", response["message"], response["trace"])
@@ -1698,6 +1995,37 @@ def run_orchestrator(db: Session, user, query: str, conversation_id: str | None 
 
         result, tool_trace = REGISTRY.execute(name, user, db, arguments)
         trace.append(tool_trace)
+        if name == "finance_analytics":
+            data = {}
+            if "finance_report" in result:
+                data = {"finance_report": result["finance_report"], "finance_view": arguments}
+            response = {
+                "conversation_id": conversation_id,
+                "agent": "Finance Agent",
+                "status": "error" if result["status"] == "error" else "completed",
+                "message": result["message"],
+                "data": data,
+                "trace": trace,
+                "approval_id": None,
+            }
+            _store_message(db, user.id, conversation_id, "assistant", response["message"], trace)
+            return response
+        if name in DOCTOR_INTELLIGENCE_TOOLS:
+            response = {
+                "conversation_id": conversation_id,
+                "agent": "Doctor AI Agent",
+                "status": {"success": "completed", "error": "error", "clarification_required": "clarification_required"}[result["status"]],
+                "message": result["message"],
+                "data": {key: result[key] for key in ("doctor_intelligence", "doctor_patient_id") if key in result},
+                "trace": trace,
+                "approval_id": None,
+            }
+            if result["status"] != "error":
+                if "doctor_patient_id" in result:
+                    arguments = {"patient_id": result["doctor_patient_id"]}
+                response["data"]["doctor_view"] = {"tool": name, "arguments": arguments}
+            _store_message(db, user.id, conversation_id, "assistant", response["message"], trace)
+            return response
         tool_results.append({"tool": name, "arguments": arguments, "result": result})
 
         if result["status"] == "error":
@@ -1719,11 +2047,32 @@ def run_orchestrator(db: Session, user, query: str, conversation_id: str | None 
         message = _summarize_tool_results(tool_results)
 
         agents = {_agent_for_result(item["tool"]) for item in tool_results}
-        agent = "Multi-Agent Orchestrator" if len(agents) > 1 else next(iter(agents), "Patient Support Agent")
+        agent = "Multi-Agent Orchestrator" if len(agents) > 1 else next(iter(agents), "Customer Support Agent")
         needs_clarification = any(
             item["result"].get("status") == "clarification_required"
             for item in tool_results
         )
+        patient_doctor_result = next((
+            item["result"] for item in tool_results
+            if user.role == "patient" and item["tool"] == "search_doctors"
+        ), None)
+        if patient_doctor_result is not None:
+            doctor_rows = patient_doctor_result.get("doctors", [])
+            response = {
+                "conversation_id": conversation_id,
+                "agent": "Hospital Operations Agent",
+                "status": "clarification_required",
+                "message": (
+                    "Choose a doctor below, then tell me your preferred appointment date."
+                    if doctor_rows else "There are currently no doctors in the directory. Please contact the clinic for help booking an appointment."
+                ),
+                "data": {"doctors": doctor_rows},
+                "trace": trace,
+                "approval_id": None,
+            }
+            _store_message(db, user.id, conversation_id, "assistant", response["message"], trace)
+            return response
+
         response = {
             "conversation_id": conversation_id,
             "agent": agent,
@@ -1740,7 +2089,7 @@ def run_orchestrator(db: Session, user, query: str, conversation_id: str | None 
     if text:
         response = {
             "conversation_id": conversation_id,
-            "agent": "Patient Support Agent",
+            "agent": "Customer Support Agent",
             "status": "completed",
             "message": text,
             "data": {},
@@ -1752,7 +2101,7 @@ def run_orchestrator(db: Session, user, query: str, conversation_id: str | None 
 
     response = {
         "conversation_id": conversation_id,
-        "agent": "Patient Support Agent",
+        "agent": "Customer Support Agent",
         "status": "clarification_required",
         "message": "Please provide more detail about the operation you need.",
         "data": {},
@@ -1782,8 +2131,8 @@ def _agent_for_result(tool_name: str) -> str:
     }:
         return "Finance Agent"
     if tool_name == "support_guidance":
-        return "Patient Support Agent"
-    return "Patient Support Agent"
+        return "Customer Support Agent"
+    return "Customer Support Agent"
 
 
 def _summarize_tool_results(tool_results: list[dict]) -> str:
@@ -1810,14 +2159,14 @@ def _summarize_tool_results(tool_results: list[dict]) -> str:
             summaries.append(f"Found {len(result.get('appointments', []))} appointment(s).")
         elif name == "financial_summary":
             summaries.append(
-                f"Revenue ₹{result.get('revenue', 0):,.2f}; "
+                f"Completed collections ₹{result.get('revenue', 0):,.2f}; "
                 f"expenses ₹{result.get('expenses', 0):,.2f}; "
-                f"net income ₹{result.get('net_income', 0):,.2f}; "
+                f"recorded movement ₹{result.get('financial_movement', 0):,.2f}; "
                 f"pending ₹{result.get('pending_amount', 0):,.2f}. "
             )
         elif name == "monthly_financial_comparison":
             summaries.append(
-                f"Current month ₹{result.get('current_month_revenue', 0):,.2f}; "
+                f"Comparable completed days in the current month ₹{result.get('current_month_revenue', 0):,.2f}; "
                 f"previous month ₹{result.get('previous_month_revenue', 0):,.2f}; "
                 f"difference ₹{result.get('difference', 0):,.2f}. "
             )

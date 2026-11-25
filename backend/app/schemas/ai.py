@@ -1,11 +1,14 @@
 from typing import Literal
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
+
+from app.schemas.finance_analytics import FinanceReport
 
 
 class ChatRequest(BaseModel):
     query: str = Field(..., min_length=3, max_length=2000)
     conversation_id: str | None = Field(default=None, max_length=64)
+    doctor_patient_id: int | None = Field(default=None, gt=0)
 
 
 class AITraceItem(BaseModel):
@@ -22,6 +25,14 @@ class AIChatResponse(BaseModel):
     data: dict = Field(default_factory=dict)
     trace: list[AITraceItem] = Field(default_factory=list)
     approval_id: str | None = None
+
+    @field_validator("data")
+    @classmethod
+    def validate_finance_report(cls, value):
+        if "finance_report" in value:
+            report = FinanceReport.model_validate(value["finance_report"])
+            return {**value, "finance_report": report.model_dump(mode="json")}
+        return value
 
 
 class ApprovalResponse(BaseModel):

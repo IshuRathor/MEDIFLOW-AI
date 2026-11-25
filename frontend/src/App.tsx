@@ -1,4 +1,4 @@
-import { useEffect, useState, type FormEvent } from 'react'
+import { useCallback, useEffect, useState, type FormEvent } from 'react'
 import './App.css'
 import {
   getAppointments,
@@ -13,10 +13,14 @@ import {
   createBill,
   createPayment,
   chatWithMediflow,
+  selectCancellationAppointment,
+  decideCancellation,
   decideAIApproval,
+  deleteAIConversation,
   deleteDoctor,
   deletePatient,
   getCurrentUser,
+  getLatestAIConversation,
   getDoctors,
   getPatients,
   getUsers,
@@ -29,6 +33,7 @@ import {
   deleteAvailability,
   updateAvailability,
   getAvailableSlots,
+  getDoctorAvailability,
   login,
   register,
   runTriage,
@@ -37,6 +42,9 @@ import {
   type AppointmentRecord,
   type PaymentUpdate,
   type ChatResponse,
+  type DoctorCancellationRequest,
+  type PatientCancellationUpdate,
+  type ConversationMessage,
   type RoleDashboardData,
   type AvailabilityRecord,
   type AppointmentSlot,
@@ -44,6 +52,12 @@ import {
   type TriageResponse,
   type UserRecord,
 } from './api'
+import DoctorSelectionCards, { patientDoctorOptions, visibleChatTrace, type PatientDoctorOption } from './DoctorSelectionCards.js'
+import { restoreConversationState, startNewConversationState } from './aiConversationState.js'
+import ChatCancellation from './ChatCancellation.js'
+import DoctorIntelligence, { doctorPrompts, type DoctorIntelligenceResult } from './DoctorIntelligence.js'
+import FinanceReport, { financePrompts, formatINR } from './FinanceReport.js'
+import { asDateKey, CALENDAR_DAYS, ChatAppointmentPicker, loadAppointmentDateSlots, loadDoctorAppointmentDates } from './chatBookingAvailability.js'
 
 type Appointment = { id: number; time: string; patient: string; detail: string; doctor: string; status: string; accent: string }
 
@@ -230,7 +244,7 @@ function ResourcePage({
   if (activeNav === 'Billing') {
     return <section className="panel resource-panel">
       <div className="panel-heading"><div><p className="eyebrow">Financial operations</p><h2>Billing</h2></div>{(role === 'admin' || role === 'staff') && <button className="outline-button" type="button" onClick={onAddBill}>+ Add bill</button>}</div>
-      {bills.length === 0 ? <p className="dashboard-state">No bills have been created yet.</p> : <div className="resource-list">{bills.map((bill) => <div className="resource-row" key={bill.id}><div className="queue-icon lime-icon">$</div><div><strong>{bill.bill_number}</strong><span>{patientById.get(bill.patient_id) ?? `Patient #${bill.patient_id}`}</span></div><strong>${bill.total_amount.toFixed(2)}</strong><span className={`status-pill ${bill.status.toLowerCase().replaceAll(' ', '-')}`}>{bill.status}</span>{(role === 'admin' || role === 'staff') && bill.status !== 'Paid' && bill.status !== 'Cancelled' && <button className="row-action" type="button" onClick={() => onPayBill(bill.id)}>Record payment</button>}</div>)}</div>}
+      {bills.length === 0 ? <p className="dashboard-state">No bills have been created yet.</p> : <div className="resource-list">{bills.map((bill) => <div className="resource-row" key={bill.id}><div className="queue-icon lime-icon">₹</div><div><strong>{bill.bill_number}</strong><span>{patientById.get(bill.patient_id) ?? `Patient #${bill.patient_id}`}</span></div><strong>{formatINR(bill.total_amount)}</strong><span className={`status-pill ${bill.status.toLowerCase().replaceAll(' ', '-')}`}>{bill.status}</span>{(role === 'admin' || role === 'staff') && bill.status !== 'Paid' && bill.status !== 'Cancelled' && <button className="row-action" type="button" onClick={() => onPayBill(bill.id)}>Record payment</button>}</div>)}</div>}
     </section>
   }
 
@@ -300,7 +314,7 @@ function CreateResourceModal({
     <button className="modal-close" type="button" onClick={onClose} aria-label="Close form">×</button>
     <p className="eyebrow">Care operations</p><h2 id="create-resource-title">{resource === 'Payment' ? 'Record payment' : `Add ${resource === 'Patients' ? 'patient' : resource === 'Doctors' ? 'doctor' : resource === 'Billing' ? 'bill' : 'appointment'}`}</h2>
     <form className="resource-form" onSubmit={submit}>
-      {resource === 'Billing' ? <><label>Patient<select required value={values.patient_id} onChange={(event) => setValues({ ...values, patient_id: event.target.value })}><option value="">Select patient</option>{patients.map((patient) => <option value={patient.id} key={patient.id}>{patient.name}</option>)}</select></label><label>Bill number<input required value={values.bill_number} onChange={(event) => setValues({ ...values, bill_number: event.target.value })} /></label><label>Total amount<input required type="number" min="0.01" step="0.01" value={values.total_amount} onChange={(event) => setValues({ ...values, total_amount: event.target.value })} /></label></> : resource === 'Payment' ? <><label>Bill<select required value={values.bill_id} onChange={(event) => setValues({ ...values, bill_id: event.target.value })}><option value="">Select bill</option>{bills.filter((bill) => bill.status !== 'Paid' && bill.status !== 'Cancelled').map((bill) => <option value={bill.id} key={bill.id}>{bill.bill_number} — ${bill.total_amount.toFixed(2)}</option>)}</select></label><label>Amount<input required type="number" min="0.01" step="0.01" value={values.total_amount} onChange={(event) => setValues({ ...values, total_amount: event.target.value })} /></label><label>Payment method<select value={values.payment_method} onChange={(event) => setValues({ ...values, payment_method: event.target.value })}><option>Card</option><option>Cash</option><option>Bank Transfer</option><option>Insurance</option><option>Other</option></select></label></> : resource === 'Appointments' ? <><label>Patient<select required value={values.patient_id} onChange={(event) => setValues({ ...values, patient_id: event.target.value })}><option value="">Select patient</option>{patients.map((patient) => <option value={patient.id} key={patient.id}>{patient.name}</option>)}</select></label><label>Doctor<select required value={values.doctor_id} onChange={(event) => setValues({ ...values, doctor_id: event.target.value })}><option value="">Select doctor</option>{doctors.map((doctor) => <option value={doctor.id} key={doctor.id}>Dr. {doctor.name}</option>)}</select></label><label>Date and time<input required type="datetime-local" value={values.appointment_date} onChange={(event) => setValues({ ...values, appointment_date: event.target.value })} /></label><label>Reason<input value={values.reason} onChange={(event) => setValues({ ...values, reason: event.target.value })} /></label></> : <><label>Name<input required minLength={2} value={values.name} onChange={(event) => setValues({ ...values, name: event.target.value })} /></label><label>Email<input required type="email" value={values.email} onChange={(event) => setValues({ ...values, email: event.target.value })} /></label>{resource === 'Patients' ? <><label>Age<input required type="number" min="0" max="130" value={values.age} onChange={(event) => setValues({ ...values, age: event.target.value })} /></label><label>Gender<input value={values.gender} onChange={(event) => setValues({ ...values, gender: event.target.value })} /></label></> : <><label>Specialization<input required value={values.specialization} onChange={(event) => setValues({ ...values, specialization: event.target.value })} /></label><label>Department<input value={values.department} onChange={(event) => setValues({ ...values, department: event.target.value })} /></label><label>Experience years<input required type="number" min="0" value={values.experience_years} onChange={(event) => setValues({ ...values, experience_years: event.target.value })} /></label></>}<label>Phone<input value={values.phone} onChange={(event) => setValues({ ...values, phone: event.target.value })} /></label></>}
+      {resource === 'Billing' ? <><label>Patient<select required value={values.patient_id} onChange={(event) => setValues({ ...values, patient_id: event.target.value })}><option value="">Select patient</option>{patients.map((patient) => <option value={patient.id} key={patient.id}>{patient.name}</option>)}</select></label><label>Bill number<input required value={values.bill_number} onChange={(event) => setValues({ ...values, bill_number: event.target.value })} /></label><label>Total amount<input required type="number" min="0.01" step="0.01" value={values.total_amount} onChange={(event) => setValues({ ...values, total_amount: event.target.value })} /></label></> : resource === 'Payment' ? <><label>Bill<select required value={values.bill_id} onChange={(event) => setValues({ ...values, bill_id: event.target.value })}><option value="">Select bill</option>{bills.filter((bill) => bill.status !== 'Paid' && bill.status !== 'Cancelled').map((bill) => <option value={bill.id} key={bill.id}>{bill.bill_number} — {formatINR(bill.total_amount)}</option>)}</select></label><label>Amount<input required type="number" min="0.01" step="0.01" value={values.total_amount} onChange={(event) => setValues({ ...values, total_amount: event.target.value })} /></label><label>Payment method<select value={values.payment_method} onChange={(event) => setValues({ ...values, payment_method: event.target.value })}><option>Card</option><option>Cash</option><option>Bank Transfer</option><option>Insurance</option><option>Other</option></select></label></> : resource === 'Appointments' ? <><label>Patient<select required value={values.patient_id} onChange={(event) => setValues({ ...values, patient_id: event.target.value })}><option value="">Select patient</option>{patients.map((patient) => <option value={patient.id} key={patient.id}>{patient.name}</option>)}</select></label><label>Doctor<select required value={values.doctor_id} onChange={(event) => setValues({ ...values, doctor_id: event.target.value })}><option value="">Select doctor</option>{doctors.map((doctor) => <option value={doctor.id} key={doctor.id}>Dr. {doctor.name}</option>)}</select></label><label>Date and time<input required type="datetime-local" value={values.appointment_date} onChange={(event) => setValues({ ...values, appointment_date: event.target.value })} /></label><label>Reason<input value={values.reason} onChange={(event) => setValues({ ...values, reason: event.target.value })} /></label></> : <><label>Name<input required minLength={2} value={values.name} onChange={(event) => setValues({ ...values, name: event.target.value })} /></label><label>Email<input required type="email" value={values.email} onChange={(event) => setValues({ ...values, email: event.target.value })} /></label>{resource === 'Patients' ? <><label>Age<input required type="number" min="0" max="130" value={values.age} onChange={(event) => setValues({ ...values, age: event.target.value })} /></label><label>Gender<input value={values.gender} onChange={(event) => setValues({ ...values, gender: event.target.value })} /></label></> : <><label>Specialization<input required value={values.specialization} onChange={(event) => setValues({ ...values, specialization: event.target.value })} /></label><label>Department<input value={values.department} onChange={(event) => setValues({ ...values, department: event.target.value })} /></label><label>Experience years<input required type="number" min="0" value={values.experience_years} onChange={(event) => setValues({ ...values, experience_years: event.target.value })} /></label></>}<label>Phone<input value={values.phone} onChange={(event) => setValues({ ...values, phone: event.target.value })} /></label></>}
       {error && <p className="form-error" role="alert">{error}</p>}
       <button className="dark-button" type="submit" disabled={saving}>{saving ? 'Saving…' : 'Save record'} <span>→</span></button>
     </form>
@@ -516,6 +530,72 @@ function AppointmentRequestsPanel({ requests, token, onUpdated }: { requests: Ar
   return <article className="panel queue-panel"><div className="panel-heading"><div><p className="eyebrow">Doctor review</p><h2>Appointment Requests</h2></div></div>{requests.length === 0 ? <p className="dashboard-state">No appointment requests are waiting for review.</p> : <div className="resource-list">{requests.map((item) => <div className="resource-row" key={String(item.id)}><strong>Request #{String(item.id)} · {String(item.patient_name)}</strong><span>{new Date(String(item.appointment_date)).toLocaleString()} · {String(item.department ?? 'Department not assigned')}</span><span>{String(item.reason ?? 'General consultation')}</span><span>Requested {item.created_at ? new Date(String(item.created_at)).toLocaleString() : 'time unavailable'} · {String(item.status)}</span><div className="approval-actions"><button className="dark-button" type="button" disabled={busyId !== null} onClick={() => void decide(Number(item.id), 'accept')}>{busyId === Number(item.id) ? 'Saving…' : 'Accept'}</button><button className="outline-button" type="button" disabled={busyId !== null} onClick={() => void decide(Number(item.id), 'decline')}>Decline</button></div></div>)}</div>}{error && <p className="form-error" role="alert">{error}</p>}</article>
 }
 
+function CancellationRequestsPanel({ requests, token, onUpdated }: {
+  requests: DoctorCancellationRequest[]
+  token: string
+  onUpdated: () => void
+}) {
+  const [rejecting, setRejecting] = useState<string | null>(null)
+  const [reason, setReason] = useState('')
+  const [busy, setBusy] = useState(false)
+  const [error, setError] = useState('')
+
+  async function decide(request: DoctorCancellationRequest, decision: 'approve' | 'reject') {
+    setBusy(true)
+    setError('')
+    try {
+      await decideCancellation(token, request, decision, decision === 'reject' ? reason : undefined)
+      setRejecting(null)
+      setReason('')
+      onUpdated()
+    } catch (requestError) {
+      setError(requestError instanceof Error ? requestError.message : 'The cancellation request could not be processed.')
+    } finally {
+      setBusy(false)
+    }
+  }
+
+  return <article className="panel queue-panel">
+    <div className="panel-heading"><h2>Cancellation requests</h2></div>
+    {requests.length === 0 ? <p className="dashboard-state">No cancellation requests are waiting for review.</p> :
+      <div className="resource-list">{requests.map((request) => <div className="resource-row" key={request.request_id}>
+        <strong>{request.patient_name}</strong>
+        <span>{new Date(request.appointment_date).toLocaleString()}</span>
+        <span>Requested {new Date(request.requested_at).toLocaleString()}</span>
+        <span>{request.status}</span>
+        {rejecting === request.request_id ?
+          <form className="resource-form" onSubmit={(event) => { event.preventDefault(); void decide(request, 'reject') }}>
+            <label>Reason (optional)<input value={reason} onChange={(event) => setReason(event.target.value)} maxLength={500} disabled={busy} /></label>
+            <div className="approval-actions">
+              <button className="dark-button" type="submit" disabled={busy}>Confirm rejection</button>
+              <button className="outline-button" type="button" disabled={busy} onClick={() => setRejecting(null)}>Back</button>
+            </div>
+          </form> :
+          <div className="approval-actions">
+            <button className="dark-button" type="button" disabled={busy || !request.can_approve} onClick={() => void decide(request, 'approve')}>Approve cancellation</button>
+            <button className="outline-button" type="button" disabled={busy} onClick={() => { setReason(''); setRejecting(request.request_id) }}>Reject cancellation</button>
+          </div>}
+      </div>)}</div>}
+    {error && <p className="form-error" role="alert">{error}</p>}
+  </article>
+}
+
+function PatientCancellationHistory({ updates }: { updates: PatientCancellationUpdate[] }) {
+  return <article className={updates.length ? 'panel queue-panel' : undefined} aria-live="polite">
+    {updates.length > 0 && <>
+      <div className="panel-heading"><h2>Appointment cancellation updates</h2></div>
+      <div className="resource-list">{updates.map((item, index) => <div className="resource-row" key={`${item.appointment_date}-${item.doctor_name}-${index}`}>
+        <strong>Dr. {item.doctor_name.replace(/^Dr\.\s*/i, '')}</strong>
+        <span>{new Date(item.appointment_date).toLocaleString()}</span>
+        <span>{item.cancellation_status === 'Pending Doctor Approval'
+          ? 'Cancellation Requested · Pending Doctor Approval'
+          : `Cancellation ${item.cancellation_status.toLowerCase()} · ${item.status}`}</span>
+        {item.cancellation_reason && <span>{item.cancellation_reason}</span>}
+      </div>)}</div>
+    </>}
+  </article>
+}
+
 function RoleDashboard({
   data,
   loading,
@@ -525,6 +605,7 @@ function RoleDashboard({
   doctors,
   onDashboardRefresh,
   onAskAI,
+  onDoctorPrompt,
 }: {
   data: RoleDashboardData | null
   loading: boolean
@@ -534,6 +615,7 @@ function RoleDashboard({
   doctors: DoctorRecord[]
   onDashboardRefresh: () => void
   onAskAI: () => void
+  onDoctorPrompt: (prompt: string) => void
 }) {
   if (loading) return <p className="dashboard-state">Loading role dashboard…</p>
   if (error) return <p className="form-error" role="alert">{error}</p>
@@ -546,6 +628,12 @@ function RoleDashboard({
     const pendingRequests = (data.pending_requests ?? []) as Array<Record<string, unknown>>
     const pastAppointments = (data.past_appointments ?? []) as Array<Record<string, unknown>>
     return <>
+      <article className="panel capacity-panel">
+        <div className="panel-heading"><h2>Doctor AI</h2></div>
+        <div className="ai-prompts" aria-label="Doctor AI suggestions">
+          {doctorPrompts.map((prompt) => <button key={prompt} type="button" onClick={() => onDoctorPrompt(prompt)}>{prompt}</button>)}
+        </div>
+      </article>
       <section className="metrics-grid" aria-label="Doctor metrics">
         <MetricCard label="Today's appointments" value={stats.todays_appointments ?? 0} tone="metric-dark" />
         <MetricCard label="Upcoming appointments" value={stats.upcoming_appointments ?? 0} tone="metric-coral" />
@@ -559,6 +647,7 @@ function RoleDashboard({
       </section>
       <section className="dashboard-grid">
         <AppointmentRequestsPanel requests={pendingRequests} token={token} onUpdated={onDashboardRefresh} />
+        <CancellationRequestsPanel requests={(data.cancellation_requests ?? []) as DoctorCancellationRequest[]} token={token} onUpdated={onDashboardRefresh} />
         <article className="panel appointments-panel"><div className="panel-heading"><div><p className="eyebrow">My schedule</p><h2>Today's appointments</h2></div></div>{schedule.length === 0 ? <p className="dashboard-state">No appointments scheduled for today.</p> : <div className="appointment-list">{schedule.map((item) => <div className="appointment-row" key={String(item.id)}><time>{new Date(String(item.appointment_date)).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}</time><div className="appointment-marker lime" /><div className="patient-info"><strong>{String(item.patient_name)}</strong><span>{String(item.reason ?? 'General consultation')}</span></div><span className="status-pill confirmed">{String(item.status)}</span></div>)}</div>}</article>
         <article className="panel capacity-panel"><div className="panel-heading"><div><p className="eyebrow">Quick actions</p><h2>Clinical tools</h2></div></div><div className="role-actions"><button className="outline-button" type="button" onClick={() => onNavigate('Patients')}>View patients</button><button className="outline-button" type="button" onClick={() => onNavigate('Appointments')}>View appointments</button></div></article>
       </section>
@@ -573,16 +662,18 @@ function RoleDashboard({
     const declined = (data.declined ?? []) as Array<Record<string, unknown>>
     const cancelled = (data.cancelled ?? []) as Array<Record<string, unknown>>
     const previous = (data.previous ?? []) as Array<Record<string, unknown>>
+    const cancellationUpdates = (data.cancellation_history ?? []) as PatientCancellationUpdate[]
     const bills = (data.bills ?? []) as Array<Record<string, unknown>>
     const payments = (data.payments ?? []) as Array<Record<string, unknown>>
     const doctor = data.assigned_doctor as Record<string, unknown> | null
     return <>
       <section className="metrics-grid" aria-label="Patient metrics"><MetricCard label="My upcoming appointments" value={stats.upcoming_appointments ?? 0} tone="metric-dark" /><MetricCard label="Pending requests" value={stats.pending_requests ?? 0} tone="metric-coral" /><MetricCard label="My bills" value={stats.bills ?? 0} tone="metric-lime" /><MetricCard label="Pending payments" value={stats.pending_payments ?? 0} /></section>
+      <PatientCancellationHistory updates={cancellationUpdates} />
       <section className="bottom-grid"><article className="panel capacity-panel"><div className="panel-heading"><div><p className="eyebrow">AI appointment agent</p><h2>Find a doctor and request a time</h2></div></div><p className="capacity-copy">Ask in your own words. MediFlow checks the doctor directory and recorded availability, then asks you to review and confirm the request.</p><button className="dark-button" type="button" onClick={onAskAI}>Ask MediFlow AI <span>→</span></button></article><PatientBooking token={token} doctors={doctors} onBooked={onDashboardRefresh} /></section>
       <section className="dashboard-grid"><article className="panel appointments-panel"><div className="panel-heading"><div><p className="eyebrow">Care journey</p><h2>Upcoming appointments</h2></div></div>{upcoming.length === 0 ? <p className="dashboard-state">No upcoming appointments.</p> : <div className="appointment-list">{upcoming.map((item) => <div className="appointment-row" key={String(item.id)}><time>{new Date(String(item.appointment_date)).toLocaleString()}</time><div className="patient-info"><strong>Dr. {String(item.doctor_name)}</strong><span>{String(item.reason ?? 'General consultation')}</span></div><span className="status-pill confirmed">{String(item.status)}</span></div>)}</div>}</article><article className="panel capacity-panel"><div className="panel-heading"><div><p className="eyebrow">My care</p><h2>Assigned doctor</h2></div></div>{doctor ? <div className="capacity-copy"><strong>Dr. {String(doctor.name)}</strong><span>{String(doctor.specialization)}</span></div> : <p className="dashboard-state">No assigned doctor yet.</p>}<div className="role-actions"><button className="outline-button" type="button" onClick={() => onNavigate('Appointments')}>Book appointment</button><button className="outline-button" type="button" onClick={() => onNavigate('Billing')}>View bills</button></div></article></section>
       <section className="dashboard-grid"><article className="panel appointments-panel"><div className="panel-heading"><div><p className="eyebrow">Request tracking</p><h2>Pending doctor approval</h2></div><button className="outline-button" type="button" onClick={onDashboardRefresh}>Refresh status</button></div>{pendingRequests.length === 0 ? <p className="dashboard-state">No pending requests.</p> : <div className="resource-list">{pendingRequests.map((item) => <div className="resource-row" key={String(item.id)}><strong>Request #{String(item.id)}</strong><span>Dr. {String(item.doctor_name)} · {new Date(String(item.appointment_date)).toLocaleString()}</span><span>{String(item.reason ?? 'General consultation')}</span><span>Pending Doctor Approval</span></div>)}</div>}</article><article className="panel capacity-panel"><div className="panel-heading"><div><p className="eyebrow">My care</p><h2>Assigned doctor</h2></div></div>{doctor ? <div className="capacity-copy"><strong>Dr. {String(doctor.name)}</strong><span>{String(doctor.specialization)}</span></div> : <p className="dashboard-state">No assigned doctor yet.</p>}<div className="role-actions"><button className="outline-button" type="button" onClick={() => onNavigate('Appointments')}>Book appointment</button><button className="outline-button" type="button" onClick={() => onNavigate('Billing')}>View bills</button></div></article></section>
       {(declined.length > 0 || cancelled.length > 0) && <section className="bottom-grid"><article className="panel queue-panel"><div className="panel-heading"><div><p className="eyebrow">Request updates</p><h2>Declined and cancelled</h2></div></div><div className="resource-list">{[...declined, ...cancelled].map((item) => <div className="resource-row" key={String(item.id)}><strong>Request #{String(item.id)} · {String(item.status)}</strong><span>Dr. {String(item.doctor_name)} · {new Date(String(item.appointment_date)).toLocaleString()}</span><span>{String(item.reason ?? 'General consultation')}</span>{Boolean(item.decline_reason) && <span>Reason: {String(item.decline_reason)}</span>}</div>)}</div></article></section>}
-      <section className="bottom-grid"><article className="panel queue-panel"><div className="panel-heading"><div><p className="eyebrow">Personal history</p><h2>Previous appointments</h2></div></div>{previous.length === 0 ? <p className="dashboard-state">No previous appointments.</p> : <div className="resource-list">{previous.map((item) => <div className="resource-row" key={String(item.id)}><strong>{new Date(String(item.appointment_date)).toLocaleDateString()}</strong><span>{String(item.reason ?? 'General consultation')}</span><span>{String(item.status)}</span></div>)}</div>}</article><article className="panel capacity-panel"><div className="panel-heading"><div><p className="eyebrow">Personal finance</p><h2>Recent bills</h2></div></div>{bills.length === 0 ? <p className="dashboard-state">No bills found.</p> : <div className="resource-list">{bills.slice(0, 6).map((bill) => <div className="resource-row" key={String(bill.id)}><strong>{String(bill.bill_number)}</strong><span>${Number(bill.total_amount).toFixed(2)}</span><span>{String(bill.status)}</span></div>)}</div>}<small>Payment history: {payments.length === 0 ? 'No payments recorded.' : `${payments.length} record(s)`}</small></article></section>
+      <section className="bottom-grid"><article className="panel queue-panel"><div className="panel-heading"><div><p className="eyebrow">Personal history</p><h2>Previous appointments</h2></div></div>{previous.length === 0 ? <p className="dashboard-state">No previous appointments.</p> : <div className="resource-list">{previous.map((item) => <div className="resource-row" key={String(item.id)}><strong>{new Date(String(item.appointment_date)).toLocaleDateString()}</strong><span>{String(item.reason ?? 'General consultation')}</span><span>{String(item.status)}</span></div>)}</div>}</article><article className="panel capacity-panel"><div className="panel-heading"><div><p className="eyebrow">Personal finance</p><h2>Recent bills</h2></div></div>{bills.length === 0 ? <p className="dashboard-state">No bills found.</p> : <div className="resource-list">{bills.slice(0, 6).map((bill) => <div className="resource-row" key={String(bill.id)}><strong>{String(bill.bill_number)}</strong><span>{formatINR(Number(bill.total_amount))}</span><span>{String(bill.status)}</span></div>)}</div>}<small>Payment history: {payments.length === 0 ? 'No payments recorded.' : `${payments.length} record(s)`}</small></article></section>
     </>
   }
 
@@ -590,9 +681,9 @@ function RoleDashboard({
     const stats = data.stats as Record<string, number>
     const transactions = (data.recent_transactions ?? []) as Array<Record<string, unknown>>
     return <>
-      <section className="metrics-grid" aria-label="Finance metrics"><MetricCard label="Total revenue" value={`$${Number(stats.total_revenue ?? 0).toFixed(2)}`} tone="metric-dark" /><MetricCard label="Today's collections" value={`$${Number(stats.todays_collections ?? 0).toFixed(2)}`} tone="metric-lime" /><MetricCard label="Monthly revenue" value={`$${Number(stats.monthly_revenue ?? 0).toFixed(2)}`} tone="metric-coral" /><MetricCard label="Outstanding bills" value={`$${Number(stats.outstanding_bills ?? 0).toFixed(2)}`} /></section>
+      <section className="metrics-grid" aria-label="Finance metrics"><MetricCard label="Total collections" value={formatINR(Number(stats.total_revenue ?? 0))} tone="metric-dark" /><MetricCard label="Today's collections" value={formatINR(Number(stats.todays_collections ?? 0))} tone="metric-lime" /><MetricCard label="Monthly collections" value={formatINR(Number(stats.monthly_revenue ?? 0))} tone="metric-coral" /><MetricCard label="Outstanding bills" value={formatINR(Number(stats.outstanding_bills ?? 0))} /></section>
       <section className="metrics-grid role-secondary-metrics"><MetricCard label="Pending payments" value={stats.pending_payments ?? 0} tone="metric-coral" /><MetricCard label="Bills generated" value={stats.total_bills_generated ?? 0} /><MetricCard label="Completed payments" value={stats.completed_payments ?? 0} tone="metric-lime" /></section>
-      <section className="dashboard-grid"><article className="panel appointments-panel"><div className="panel-heading"><div><p className="eyebrow">Recent activity</p><h2>Transactions</h2></div></div>{transactions.length === 0 ? <p className="dashboard-state">No completed transactions.</p> : <div className="resource-list">{transactions.map((item) => <div className="resource-row" key={String(item.id)}><strong>${Number(item.amount).toFixed(2)}</strong><span>{String(item.payment_method)}</span><span>{String(item.payment_status)}</span></div>)}</div>}</article><article className="panel capacity-panel"><div className="panel-heading"><div><p className="eyebrow">Quick actions</p><h2>Financial tools</h2></div></div><div className="role-actions"><button className="outline-button" type="button" onClick={() => onNavigate('Billing')}>Create bill</button><button className="outline-button" type="button" onClick={() => onNavigate('Billing')}>Record payment</button></div></article></section>
+      <section className="dashboard-grid"><article className="panel appointments-panel"><div className="panel-heading"><div><p className="eyebrow">Recent activity</p><h2>Transactions</h2></div></div>{transactions.length === 0 ? <p className="dashboard-state">No completed transactions.</p> : <div className="resource-list">{transactions.map((item) => <div className="resource-row" key={String(item.id)}><strong>{formatINR(Number(item.amount))}</strong><span>{String(item.payment_method)}</span><span>{String(item.payment_status)}</span></div>)}</div>}</article><article className="panel capacity-panel"><div className="panel-heading"><div><p className="eyebrow">Quick actions</p><h2>Financial tools</h2></div></div><div className="role-actions"><button className="outline-button" type="button" onClick={() => onNavigate('Billing')}>Create bill</button><button className="outline-button" type="button" onClick={() => onNavigate('Billing')}>Record payment</button></div></article></section>
     </>
   }
 
@@ -602,7 +693,7 @@ function RoleDashboard({
   const activity = (data.recent_activity ?? []) as Array<Record<string, unknown>>
   return <>
     <section className="metrics-grid" aria-label="Administrator metrics"><MetricCard label="Total patients" value={stats.total_patients ?? 0} tone="metric-dark" /><MetricCard label="Total doctors" value={stats.total_doctors ?? 0} tone="metric-coral" /><MetricCard label="Total appointments" value={stats.total_appointments ?? 0} tone="metric-lime" /><MetricCard label="Today's appointments" value={stats.todays_appointments ?? 0} /></section>
-    <section className="metrics-grid role-secondary-metrics"><MetricCard label="Revenue" value={`$${Number(stats.revenue ?? 0).toFixed(2)}`} tone="metric-lime" /><MetricCard label="Pending bills" value={stats.pending_bills ?? 0} tone="metric-coral" /><MetricCard label="Pending approvals" value={stats.pending_staff_approvals ?? 0} tone="metric-dark" /><MetricCard label="Hospital occupancy" value={stats.hospital_occupancy === null ? 'Unavailable' : String(stats.hospital_occupancy)} /></section>
+    <section className="metrics-grid role-secondary-metrics"><MetricCard label="Collections" value={formatINR(Number(stats.revenue ?? 0))} tone="metric-lime" /><MetricCard label="Pending bills" value={stats.pending_bills ?? 0} tone="metric-coral" /><MetricCard label="Pending approvals" value={stats.pending_staff_approvals ?? 0} tone="metric-dark" /><MetricCard label="Hospital occupancy" value={stats.hospital_occupancy === null ? 'Unavailable' : String(stats.hospital_occupancy)} /></section>
     <section className="dashboard-grid"><article className="panel appointments-panel"><div className="panel-heading"><div><p className="eyebrow">Hospital operations</p><h2>Recent appointments</h2></div></div>{recentAppointments.length === 0 ? <p className="dashboard-state">No appointments recorded.</p> : <div className="resource-list">{recentAppointments.map((item) => <div className="resource-row" key={String(item.id)}><strong>{String(item.patient_name)}</strong><span>{String(item.doctor_name)}</span><span>{String(item.status)}</span></div>)}</div>}</article><article className="panel capacity-panel"><div className="panel-heading"><div><p className="eyebrow">Quick actions</p><h2>Administration</h2></div></div><div className="role-actions"><button className="outline-button" type="button" onClick={() => onNavigate('Accounts')}>Manage staff</button><button className="outline-button" type="button" onClick={() => onNavigate('Patients')}>Manage patients</button><button className="outline-button" type="button" onClick={() => onNavigate('Doctors')}>Manage doctors</button></div></article></section>
     <section className="bottom-grid"><article className="panel queue-panel"><div className="panel-heading"><div><p className="eyebrow">Departments</p><h2>Doctor statistics</h2></div></div>{departments.length === 0 ? <p className="dashboard-state">No department data available.</p> : <div className="resource-list">{departments.map((item) => <div className="resource-row" key={String(item.department)}><strong>{String(item.department)}</strong><span>{String(item.doctor_count)} doctors</span></div>)}</div>}</article><article className="panel capacity-panel"><div className="panel-heading"><div><p className="eyebrow">Audit trail</p><h2>Recent activity</h2></div></div>{activity.length === 0 ? <p className="dashboard-state">No recent activity.</p> : <div className="resource-list">{activity.map((item) => <div className="resource-row" key={String(item.id)}><strong>{String(item.action)}</strong><span>{String(item.resource)}</span></div>)}</div>}</article></section>
   </>
@@ -618,8 +709,24 @@ function App() {
   const [chatOpen, setChatOpen] = useState(false)
   const [chatQuery, setChatQuery] = useState('')
   const [chatResponse, setChatResponse] = useState<ChatResponse | null>(null)
+  const [chatMessages, setChatMessages] = useState<ConversationMessage[]>([])
+  const [selectedChatDoctor, setSelectedChatDoctor] = useState<PatientDoctorOption | null>(null)
+  const [selectedChatDate, setSelectedChatDate] = useState('')
+  const [selectedChatTime, setSelectedChatTime] = useState('')
+  const [chatCalendarMonth, setChatCalendarMonth] = useState(() => {
+    const now = new Date()
+    return new Date(now.getFullYear(), now.getMonth(), 1)
+  })
+  const [chatAvailabilityDates, setChatAvailabilityDates] = useState<string[]>([])
+  const [chatAvailabilityLoading, setChatAvailabilityLoading] = useState(false)
+  const [chatAvailabilityError, setChatAvailabilityError] = useState('')
+  const [chatDateSlots, setChatDateSlots] = useState<AppointmentSlot[]>([])
+  const [chatDateSlotsLoading, setChatDateSlotsLoading] = useState(false)
+  const [chatDateSlotsError, setChatDateSlotsError] = useState('')
   const [chatError, setChatError] = useState('')
   const [chatLoading, setChatLoading] = useState(false)
+  const [chatRestoreLoading, setChatRestoreLoading] = useState(false)
+  const [freshConversation, setFreshConversation] = useState(false)
   const [conversationId, setConversationId] = useState<string>()
   const [approvalLoading, setApprovalLoading] = useState(false)
   const [token, setToken] = useState(() => localStorage.getItem('mediflow_access_token') ?? '')
@@ -636,6 +743,90 @@ function App() {
   const [users, setUsers] = useState<UserRecord[]>([])
   const [pendingUsers, setPendingUsers] = useState<UserRecord[]>([])
   const [accountModalOpen, setAccountModalOpen] = useState(false)
+
+  const loadChatDoctorAvailability = useCallback(async (doctor: PatientDoctorOption, restoredDate = '') => {
+    const doctorId = Number(doctor.id)
+    if (!Number.isInteger(doctorId) || doctorId < 1) {
+      setChatAvailabilityError('The selected doctor schedule could not be loaded.')
+      return
+    }
+    setChatAvailabilityLoading(true)
+    setChatAvailabilityError('')
+    try {
+      const availableDates = await loadDoctorAppointmentDates({
+        doctorId,
+        startDate: asDateKey(currentTime),
+        getAvailability: (id) => getDoctorAvailability(token, id),
+        getSlots: (id, date) => getAvailableSlots(token, id, date),
+        dayCount: CALENDAR_DAYS,
+      })
+      setChatAvailabilityDates(availableDates)
+    } catch (error) {
+      setChatAvailabilityDates([])
+      setChatAvailabilityError(error instanceof Error ? error.message : 'The doctor schedule could not be loaded.')
+    } finally {
+      setChatAvailabilityLoading(false)
+    }
+
+    if (restoredDate) {
+      setChatDateSlotsLoading(true)
+      setChatDateSlotsError('')
+      try {
+        const result = await loadAppointmentDateSlots({ doctorId, date: restoredDate, getSlots: (id, date) => getAvailableSlots(token, id, date) })
+        setChatDateSlots(result.slots)
+      } catch (error) {
+        setChatDateSlots([])
+        setChatDateSlotsError(error instanceof Error ? error.message : 'Appointment times could not be loaded.')
+      } finally {
+        setChatDateSlotsLoading(false)
+      }
+    }
+  }, [currentTime, token])
+
+  function selectChatDoctor(doctor: PatientDoctorOption) {
+    setSelectedChatDoctor(doctor)
+    setSelectedChatDate('')
+    setSelectedChatTime('')
+    setChatAvailabilityDates([])
+    const now = currentTime
+    setChatCalendarMonth(new Date(now.getFullYear(), now.getMonth(), 1))
+    setChatDateSlots([])
+    setChatDateSlotsError('')
+    void loadChatDoctorAvailability(doctor)
+    void askChat(`I want to book an appointment with Dr. ${doctor.name}`)
+  }
+
+  async function selectChatAppointmentDate(date: string) {
+    if (!selectedChatDoctor) return
+    setSelectedChatDate(date)
+    setSelectedChatTime('')
+    setChatDateSlots([])
+    setChatDateSlotsError('')
+    setChatDateSlotsLoading(true)
+    void askChat(date)
+    try {
+      const result = await loadAppointmentDateSlots({
+        doctorId: Number(selectedChatDoctor.id),
+        date,
+        getSlots: (id, targetDate) => getAvailableSlots(token, id, targetDate),
+      })
+      setChatDateSlots(result.slots)
+      if (result.blocked || !result.slots.some((slot) => slot.status === 'available')) {
+        setChatAvailabilityDates((dates) => dates.filter((item) => item !== date))
+      }
+    } catch (error) {
+      setChatDateSlotsError(error instanceof Error ? error.message : 'Appointment times could not be loaded.')
+    } finally {
+      setChatDateSlotsLoading(false)
+    }
+  }
+
+  function selectChatAppointmentTime(slot: AppointmentSlot) {
+    if (!selectedChatDate) return
+    const time = slot.start.slice(11, 16)
+    setSelectedChatTime(time)
+    void askChat(`${selectedChatDate} at ${time}`)
+  }
 
   useEffect(() => {
     if (!token) return
@@ -710,8 +901,73 @@ function App() {
       setToken('')
       setConversationId(undefined)
       setChatResponse(null)
+      setChatMessages([])
+      setSelectedChatDoctor(null)
+      setSelectedChatDate('')
+      setSelectedChatTime('')
+      setChatAvailabilityDates([])
+      setChatDateSlots([])
+      setChatAvailabilityError('')
+      setChatDateSlotsError('')
+      setFreshConversation(false)
     })
   }, [token])
+
+  useEffect(() => {
+    const role = currentUser?.role
+    if (!token || (role !== 'patient' && role !== 'clinician')) return
+    let active = true
+    const interval = window.setInterval(() => {
+      if (document.hidden) return
+      void getRoleDashboard(token, role).then((dashboard) => {
+        if (active) setRoleDashboard(dashboard)
+      }).catch(() => {})
+    }, 30_000)
+    return () => {
+      active = false
+      window.clearInterval(interval)
+    }
+  }, [token, currentUser?.role])
+
+  useEffect(() => {
+    if (!chatOpen || !token || freshConversation) return
+    let active = true
+    void getLatestAIConversation(token).then((snapshot) => {
+      if (!active) return
+      const restored = restoreConversationState(snapshot)
+      setConversationId(restored.conversationId)
+      setChatMessages(restored.messages)
+      setChatResponse(restored.response)
+      setSelectedChatDoctor(restored.selectedDoctor as PatientDoctorOption | null)
+      setSelectedChatDate(restored.selectedDate)
+      setSelectedChatTime(restored.selectedTime)
+      if (restored.selectedDate) {
+        const restoredDate = new Date(`${restored.selectedDate}T12:00:00`)
+        setChatCalendarMonth(new Date(restoredDate.getFullYear(), restoredDate.getMonth(), 1))
+      }
+      if (restored.selectedDoctor && currentUser?.role === 'patient') {
+        void loadChatDoctorAvailability(restored.selectedDoctor as PatientDoctorOption, restored.selectedDate)
+      }
+      setChatError('')
+    }).catch((error) => {
+      if (!active) return
+      const empty = startNewConversationState()
+      setConversationId(empty.conversationId)
+      setChatMessages(empty.messages)
+      setChatResponse(empty.response)
+      setSelectedChatDoctor(empty.selectedDoctor)
+      setSelectedChatDate(empty.selectedDate)
+      setSelectedChatTime(empty.selectedTime)
+      setChatAvailabilityDates([])
+      setChatDateSlots([])
+      setChatAvailabilityError('')
+      setChatDateSlotsError('')
+      setChatError(error instanceof Error ? `Saved conversation unavailable: ${error.message}` : 'Saved conversation unavailable. Start a new conversation.')
+    }).finally(() => {
+      if (active) setChatRestoreLoading(false)
+    })
+    return () => { active = false }
+  }, [chatOpen, token, freshConversation, currentUser?.role, loadChatDoctorAvailability])
 
   if (!token) {
     return <AuthScreen onAuthenticated={(accessToken, user) => {
@@ -743,20 +999,124 @@ function App() {
     }
   }
 
+  async function askChat(text: string, doctorPatientId?: number) {
+    if (text.trim().length < 3) return
+    setChatLoading(true)
+    setChatError('')
+    try {
+      setChatQuery(text)
+      const response = await chatWithMediflow(text.trim(), token, conversationId, doctorPatientId)
+      setChatResponse(response)
+      setConversationId(response.conversation_id)
+      setChatMessages((messages) => [
+        ...messages,
+        { role: 'user', content: text.trim() },
+        { role: 'assistant', content: response.message },
+      ])
+      setFreshConversation(false)
+      if ('cancellation_options' in response.data || 'cancellation_selection' in response.data) {
+        setSelectedChatDoctor(null)
+        setSelectedChatDate('')
+        setSelectedChatTime('')
+      }
+      const doctor = response.data.doctor
+      if (doctor && typeof doctor === 'object' && 'id' in doctor && 'name' in doctor) {
+        setSelectedChatDoctor(doctor as PatientDoctorOption)
+      }
+      const responseDate = response.data.date ?? response.data.appointment_date
+      if (typeof responseDate === 'string') setSelectedChatDate(responseDate.slice(0, 10))
+      const responseTime = response.data.time ?? response.data.appointment_time
+      if (typeof responseTime === 'string') setSelectedChatTime(responseTime.slice(0, 5))
+    } catch (error) {
+      const message = error instanceof Error ? error.message : 'The AI assistant is unavailable.'
+      if (message.toLowerCase().includes('no longer available')) {
+        const empty = startNewConversationState()
+        setConversationId(empty.conversationId)
+        setChatMessages(empty.messages)
+        setChatResponse(empty.response)
+        setSelectedChatDoctor(empty.selectedDoctor)
+        setFreshConversation(true)
+        setChatError('This conversation was deleted or is unavailable. Start a new conversation to continue.')
+      } else {
+        setChatError(message)
+      }
+    } finally {
+      setChatLoading(false)
+    }
+  }
+
   async function submitChat(event: FormEvent<HTMLFormElement>) {
     event.preventDefault()
     if (chatQuery.trim().length < 3) {
       setChatError('Ask a question with at least three characters.')
       return
     }
+    await askChat(chatQuery)
+  }
+
+  async function selectChatCancellation(appointmentId: number) {
+    if (!conversationId || chatLoading) return
     setChatLoading(true)
     setChatError('')
     try {
-      const response = await chatWithMediflow(chatQuery.trim(), token, conversationId)
+      const response = await selectCancellationAppointment(token, conversationId, appointmentId)
       setChatResponse(response)
-      setConversationId(response.conversation_id)
+      setChatMessages((messages) => [...messages, { role: 'assistant', content: response.message }])
     } catch (error) {
-      setChatError(error instanceof Error ? error.message : 'The AI assistant is unavailable.')
+      setChatError(error instanceof Error ? error.message : 'The appointment could not be selected.')
+    } finally {
+      setChatLoading(false)
+    }
+  }
+
+  function openAIChat() {
+    if (!freshConversation) setChatRestoreLoading(true)
+    setChatOpen(true)
+  }
+
+  function startNewConversation() {
+    if (chatResponse?.status === 'approval_required') {
+      setChatError('Resolve the pending confirmation before starting a new conversation.')
+      return
+    }
+    const empty = startNewConversationState()
+    setConversationId(empty.conversationId)
+    setChatMessages(empty.messages)
+    setChatResponse(empty.response)
+    setSelectedChatDoctor(empty.selectedDoctor)
+    setSelectedChatDate(empty.selectedDate)
+    setSelectedChatTime(empty.selectedTime)
+    setChatAvailabilityDates([])
+    setChatDateSlots([])
+    setChatAvailabilityError('')
+    setChatDateSlotsError('')
+    setChatQuery('')
+    setChatError('')
+    setFreshConversation(true)
+  }
+
+  async function removeCurrentConversation() {
+    if (!conversationId) return
+    if (!window.confirm('Delete this conversation and its associated AI approvals?')) return
+    setChatLoading(true)
+    try {
+      await deleteAIConversation(token, conversationId)
+      const empty = startNewConversationState()
+      setConversationId(empty.conversationId)
+      setChatMessages(empty.messages)
+      setChatResponse(empty.response)
+      setSelectedChatDoctor(empty.selectedDoctor)
+      setSelectedChatDate(empty.selectedDate)
+      setSelectedChatTime(empty.selectedTime)
+      setChatAvailabilityDates([])
+      setChatDateSlots([])
+      setChatAvailabilityError('')
+      setChatDateSlotsError('')
+      setChatQuery('')
+      setChatError('Conversation deleted.')
+      setFreshConversation(true)
+    } catch (error) {
+      setChatError(error instanceof Error ? error.message : 'The conversation could not be deleted.')
     } finally {
       setChatLoading(false)
     }
@@ -778,6 +1138,7 @@ function App() {
         approval_id: null,
         data: response.result ?? {},
       })
+      setChatMessages((messages) => [...messages, { role: 'assistant', content: resultMessage }])
       if (currentUser) void getRoleDashboard(token, currentUser.role).then(setRoleDashboard)
     } catch (error) {
       setChatError(error instanceof Error ? error.message : 'The approval could not be processed.')
@@ -796,6 +1157,9 @@ function App() {
   }
 
   const dashboardRole = currentUser?.role ?? 'admin'
+  const chatDoctors = chatResponse ? patientDoctorOptions(chatResponse.data) : []
+  const chatTraceLabel = chatResponse ? visibleChatTrace(currentUser?.role, chatResponse.trace) : null
+  const latestAssistantMessageIndex = chatMessages.reduce((latest, message, index) => message.role === 'assistant' ? index : latest, -1)
   const dashboardCopy = {
     admin: { label: 'Administrator dashboard', title: 'Hospital command center', text: 'Monitor every department, team, and operational decision from one workspace.' },
     staff: { label: 'Finance staff dashboard', title: 'Financial operations center', text: 'Keep billing, collections, and hospital operations moving smoothly.' },
@@ -819,11 +1183,11 @@ function App() {
         </nav>
         <div className="sidebar-spacer" />
         <div className="system-status"><span className="status-dot" /><div><strong>Workspace connected</strong><span>API session active</span></div></div>
-        <div className="user-chip"><div className="avatar avatar-dark">{(currentUser?.full_name ?? 'AR').slice(0, 2).toUpperCase()}</div><div><strong>{currentUser?.full_name ?? 'Hospital user'}</strong><span>{currentUser?.role ?? 'Administrator'}</span></div><button type="button" className="more-button" aria-label="Sign out" onClick={() => { localStorage.removeItem('mediflow_access_token'); setToken(''); setCurrentUser(null); setConversationId(undefined); setChatResponse(null) }}>↗</button></div>
+      <div className="user-chip"><div className="avatar avatar-dark">{(currentUser?.full_name ?? 'AR').slice(0, 2).toUpperCase()}</div><div><strong>{currentUser?.full_name ?? 'Hospital user'}</strong><span>{currentUser?.role ?? 'Administrator'}</span></div><button type="button" className="more-button" aria-label="Sign out" onClick={() => { localStorage.removeItem('mediflow_access_token'); setToken(''); setCurrentUser(null); setConversationId(undefined); setChatResponse(null); setChatMessages([]); setSelectedChatDoctor(null); setSelectedChatDate(''); setSelectedChatTime(''); setChatAvailabilityDates([]); setChatDateSlots([]); setFreshConversation(false) }}>↗</button></div>
       </aside>
 
       <main className="main-content">
-        <header className="topbar"><div className="breadcrumb"><span>Workspace</span><b>/</b>{activeNav}</div><div className="topbar-actions"><button className="icon-button" type="button" aria-label="Search">⌕</button><button className="icon-button notification" type="button" aria-label="Notifications">◌<span /></button>{currentUser?.role === 'admin' && <button className="outline-button" type="button" onClick={() => setAccountModalOpen(true)}>+ Create account</button>}<button className="outline-button" type="button" onClick={() => setChatOpen(true)}>Ask MediFlow</button><button className="outline-button" type="button" onClick={() => setTriageOpen(true)}>+ New triage</button></div></header>
+        <header className="topbar"><div className="breadcrumb"><span>Workspace</span><b>/</b>{activeNav}</div><div className="topbar-actions"><button className="icon-button" type="button" aria-label="Search">⌕</button><button className="icon-button notification" type="button" aria-label="Notifications">◌<span /></button>{currentUser?.role === 'admin' && <button className="outline-button" type="button" onClick={() => setAccountModalOpen(true)}>+ Create account</button>}<button className="outline-button" type="button" onClick={openAIChat}>Ask MediFlow</button><button className="outline-button" type="button" onClick={() => setTriageOpen(true)}>+ New triage</button></div></header>
         <div className="content-wrap">
           {activeNav !== 'Overview' ? <ResourcePage activeNav={activeNav} role={currentUser?.role ?? 'clinician'} patients={patients} doctors={doctors} bills={bills} appointments={appointments} users={users} pendingUsers={pendingUsers} loading={dataLoading} error={dataError} onAdd={() => { if (activeNav === 'Patients' || activeNav === 'Doctors') setCreateResource(activeNav) }} onAddBill={() => setCreateResource('Billing')} onAddAppointment={() => setCreateResource('Appointments')} onAddAccount={() => setAccountModalOpen(true)} onApproveUser={(id) => { void runMutation(async () => { await approveUser(token, id); setPendingUsers((current) => current.filter((user) => user.id !== id)); setUsers(await getUsers(token)) }) }} onRejectUser={(id) => { void runMutation(async () => { await rejectUser(token, id); setPendingUsers((current) => current.filter((user) => user.id !== id)); setUsers(await getUsers(token)) }) }} onPayBill={(_id) => setCreateResource('Payment')} onDeletePatient={(id) => { if (!window.confirm('Delete this patient?')) return; void runMutation(async () => { await deletePatient(token, id); setPatients((current) => current.filter((patient) => patient.id !== id)) }) }} onDeleteDoctor={(id) => { if (!window.confirm('Delete this doctor?')) return; void runMutation(async () => { await deleteDoctor(token, id); setDoctors((current) => current.filter((doctor) => doctor.id !== id)) }) }} onCancelAppointment={(id) => { if (!window.confirm('Cancel this appointment?')) return; void runMutation(async () => { await cancelAppointment(token, id); setAppointments((current) => current.map((appointment) => appointment.id === id ? { ...appointment, status: 'Cancelled' } : appointment)) }) }} /> : <>
           <section className="welcome-row"><div><p className="eyebrow">{dashboardCopy.label} <span>·</span> {todayLabel} <span>·</span> {timeLabel}</p><h1>{dashboardCopy.title}<span>.</span></h1><p className="subhead">{dashboardCopy.text}</p></div></section>
@@ -834,7 +1198,8 @@ function App() {
             onNavigate={setActiveNav}
             token={token}
             doctors={doctors}
-            onAskAI={() => setChatOpen(true)}
+            onAskAI={openAIChat}
+            onDoctorPrompt={(prompt) => { setChatQuery(prompt); openAIChat() }}
             onDashboardRefresh={() => {
               if (!currentUser) return
               void getRoleDashboard(token, currentUser.role).then(setRoleDashboard).catch((requestError) => setDataError(requestError instanceof Error ? requestError.message : 'Dashboard could not be refreshed'))
@@ -846,30 +1211,74 @@ function App() {
       </>})()}
 
       {triageOpen && <div className="modal-backdrop" role="presentation" onClick={() => setTriageOpen(false)}><div className="triage-modal" role="dialog" aria-modal="true" aria-labelledby="triage-title" onClick={(event) => event.stopPropagation()}><button className="modal-close" type="button" onClick={() => setTriageOpen(false)} aria-label="Close triage">×</button><p className="eyebrow">AI assisted triage</p><h2 id="triage-title">What is the patient feeling?</h2>{triageResult ? <div className="triage-result"><strong>{triageResult.urgency} urgency</strong><span>{triageResult.recommended_department}</span><p>{triageResult.recommended_action}</p><small>{triageResult.safety_notice}</small><small>{triageResult.disclaimer}</small><button className="dark-button" type="button" onClick={() => setTriageResult(null)}>Run another <span>→</span></button></div> : <><textarea value={symptoms} maxLength={500} onChange={(event) => setSymptoms(event.target.value)} placeholder="Describe symptoms in plain language..." />{triageError && <p className="form-error" role="alert">{triageError}</p>}<div className="modal-footer"><span>{symptoms.length}/500</span><button className="dark-button" type="button" onClick={submitTriage} disabled={triageLoading}>{triageLoading ? 'Assessing…' : 'Run assessment'} <span>→</span></button></div></>}</div></div>}
-      {chatOpen && <div className="modal-backdrop" role="presentation" onClick={() => setChatOpen(false)}>
+      {chatOpen && <div className="modal-backdrop chat-modal-backdrop" role="presentation" onClick={() => setChatOpen(false)}>
         <div className="triage-modal chat-modal" role="dialog" aria-modal="true" aria-labelledby="chat-title" onClick={(event) => event.stopPropagation()}>
           <button className="modal-close" type="button" onClick={() => setChatOpen(false)} aria-label="Close AI assistant">×</button>
-          <p className="eyebrow">Operational assistant</p><h2 id="chat-title">Ask MyDFlow AI.</h2>
-          <p className="auth-copy">Ask in natural language to complete authorized hospital operations.</p>
-          <div className="ai-prompts">
-            {(dashboardRole === 'patient'
-              ? ['Find a cardiologist', 'Show my upcoming appointments', 'Show my pending bills', 'Book an appointment']
-              : dashboardRole === 'clinician'
-                ? ['Show my appointments today', 'Show my upcoming patients', 'Show my availability']
-                : dashboardRole === 'staff'
-                  ? ["Show today's collections", 'Find pending payments', "Generate this month's financial summary"]
-                  : ['Show hospital overview', 'How many appointments are scheduled today?', 'Show pending staff approvals']
-            ).map((prompt) => <button type="button" key={prompt} onClick={() => setChatQuery(prompt)}>{prompt}</button>)}
+          <header className="chat-modal-header">
+            <p className="eyebrow">Operational assistant</p><h2 id="chat-title">{dashboardRole === 'clinician' ? 'Doctor AI' : dashboardRole === 'staff' ? 'Finance AI' : 'Ask MyDFlow AI.'}</h2>
+            <p className="auth-copy">Ask in natural language to complete authorized hospital operations.</p>
+          </header>
+          <div className="chat-modal-tools">
+            <div className="conversation-actions">
+              <button className="outline-button" type="button" onClick={startNewConversation} disabled={chatLoading || chatRestoreLoading}>New conversation</button>
+              {conversationId && <button className="outline-button" type="button" onClick={() => void removeCurrentConversation()} disabled={chatLoading || chatRestoreLoading}>Delete conversation</button>}
+            </div>
+            <div className="ai-prompts">
+              {(dashboardRole === 'patient'
+                ? ['Find a cardiologist', 'Show my upcoming appointments', 'Show my pending bills', 'Book an appointment', 'Cancel my appointment']
+                : dashboardRole === 'clinician'
+                  ? doctorPrompts
+                  : dashboardRole === 'staff'
+                    ? financePrompts
+                    : ['Show hospital overview', 'How many appointments are scheduled today?', 'Show pending staff approvals', 'Show our financial performance trend']
+              ).map((prompt) => <button type="button" key={prompt} onClick={() => setChatQuery(prompt)}>{prompt}</button>)}
+            </div>
           </div>
-          {chatResponse && <div className="chat-response">
-            <strong>{chatResponse.agent ?? 'MyDFlow AI'}</strong>
-            <p>{chatResponse.message ?? 'The assistant returned a structured operational result.'}</p>
-            {Array.isArray(chatResponse.data.doctors) && <div className="resource-list">{(chatResponse.data.doctors as Array<Record<string, unknown>>).map((doctor) => <div className="resource-row" key={String(doctor.id)}><strong>Dr. {String(doctor.name)}</strong><span>{String(doctor.specialization)} · {String(doctor.department ?? 'Department not assigned')}</span>{Array.isArray(doctor.availability) && <span>{(doctor.availability as Array<Record<string, unknown>>).map((rule) => `${String(rule.specific_date ?? rule.day)} ${String(rule.start_time)}–${String(rule.end_time)}`).join(' · ') || 'No availability schedule on file'}</span>}</div>)}</div>}
-            {chatResponse.status === 'approval_required' && chatResponse.approval_id && <div className="approval-actions"><button className="dark-button" type="button" disabled={approvalLoading} onClick={() => void decideApproval('approve')}>{approvalLoading ? 'Processing…' : chatResponse.trace.some((item) => item.tool === 'create_appointment') ? 'Confirm and send request' : 'Approve'} <span>→</span></button><button className="outline-button" type="button" disabled={approvalLoading} onClick={() => void decideApproval('reject')}>Cancel</button></div>}
-            <small>{chatResponse.status === 'completed' ? 'Completed' : chatResponse.status === 'clarification_required' ? 'Clarification needed' : chatResponse.status === 'approval_required' ? 'Waiting for approval' : 'Request error'}</small>
-            {chatResponse.trace.length > 0 && <small>{chatResponse.trace.map((item) => `${item.tool}: ${item.status}`).join(' · ')}</small>}
-          </div>}
-          <form className="resource-form" onSubmit={submitChat}><label>Question<textarea required minLength={3} maxLength={2000} value={chatQuery} onChange={(event) => setChatQuery(event.target.value)} placeholder="Ask about operations, billing, scheduling, or support..." /></label>{chatError && <p className="form-error" role="alert">{chatError}</p>}<button className="dark-button" type="submit" disabled={chatLoading}>{chatLoading ? 'Thinking…' : 'Ask assistant'} <span>→</span></button></form>
+          {chatRestoreLoading && <p className="dashboard-state">Restoring your latest conversation…</p>}
+          <div className="conversation-transcript" aria-live="polite">
+            {chatMessages.map((message, index) => <div className={`conversation-message ${message.role}`} key={`${conversationId ?? 'new'}-${index}`}>
+              {message.role === 'assistant' && index === latestAssistantMessageIndex && <strong>{chatResponse?.agent ?? 'MediFlow AI'}</strong>}
+              <p>{message.content}</p>
+              {message.role === 'assistant' && index === latestAssistantMessageIndex && chatResponse && <>
+                {(currentUser?.role === 'staff' || currentUser?.role === 'admin') && <FinanceReport report={chatResponse.data.finance_report} />}
+                {currentUser?.role === 'clinician' && <DoctorIntelligence
+                  result={chatResponse.data.doctor_intelligence as DoctorIntelligenceResult | undefined}
+                  disabled={chatLoading || chatRestoreLoading || approvalLoading}
+                  onSelect={(id) => void askChat("Show this patient's appointment history", id)}
+                />}
+                <DoctorSelectionCards doctors={chatDoctors} disabled={chatLoading || chatAvailabilityLoading} onSelect={selectChatDoctor} />
+                {selectedChatDoctor && <p className="chat-selection-note">Selected doctor: Dr. {selectedChatDoctor.name}</p>}
+                {currentUser?.role === 'patient' && selectedChatDoctor && <ChatAppointmentPicker
+                  availabilityDates={chatAvailabilityDates}
+                  availabilityLoading={chatAvailabilityLoading}
+                  availabilityError={chatAvailabilityError}
+                  selectedDate={selectedChatDate}
+                  slots={chatDateSlots}
+                  slotsLoading={chatDateSlotsLoading}
+                  slotsError={chatDateSlotsError}
+                  selectedTime={selectedChatTime}
+                  viewMonth={chatCalendarMonth}
+                  onChangeMonth={setChatCalendarMonth}
+                  startDate={asDateKey(currentTime)}
+                  disabled={chatLoading || chatResponse.status === 'approval_required'}
+                  onSelectDate={(date) => void selectChatAppointmentDate(date)}
+                  onSelectSlot={selectChatAppointmentTime}
+                />}
+                {(!selectedChatDoctor || currentUser?.role !== 'patient') && Array.isArray(chatResponse.data.available_slots) && <div className="ai-prompts" aria-label="Available appointment times">{(chatResponse.data.available_slots as string[]).map((slot) => { const time = new Date(slot); const label = Number.isNaN(time.getTime()) ? slot : time.toLocaleTimeString([], { hour: 'numeric', minute: '2-digit' }); return <button type="button" key={slot} disabled={chatLoading} onClick={() => void askChat(label)}>{label}</button> })}</div>}
+                {currentUser?.role === 'patient' && <ChatCancellation
+                  data={chatResponse.data}
+                  disabled={chatLoading || chatRestoreLoading || approvalLoading}
+                  canConfirm={chatResponse.status === 'approval_required' && Boolean(chatResponse.approval_id)}
+                  onSelect={(id) => void selectChatCancellation(id)}
+                  onDecision={(decision) => void decideApproval(decision)}
+                />}
+                {chatResponse.status === 'approval_required' && chatResponse.approval_id && !chatResponse.data.cancellation_selection && <div className="approval-actions"><button className="dark-button" type="button" disabled={approvalLoading} onClick={() => void decideApproval('approve')}>{approvalLoading ? 'Processing…' : chatResponse.trace.some((item) => item.tool === 'create_appointment') ? 'Confirm and send request' : 'Approve'} <span>→</span></button><button className="outline-button" type="button" disabled={approvalLoading} onClick={() => void decideApproval('reject')}>Cancel</button></div>}
+                <small>{chatResponse.status === 'completed' ? 'Completed' : chatResponse.status === 'clarification_required' ? 'Clarification needed' : chatResponse.status === 'approval_required' ? 'Waiting for approval' : 'Request error'}</small>
+                {chatTraceLabel && <small>{chatTraceLabel}</small>}
+              </>}
+            </div>)}
+          </div>
+          <form className="resource-form chat-composer" onSubmit={submitChat}><label>Question<textarea required minLength={3} maxLength={2000} disabled={chatLoading || chatRestoreLoading || chatResponse?.status === 'approval_required'} value={chatQuery} onChange={(event) => setChatQuery(event.target.value)} placeholder="Ask about operations, billing, scheduling, or support..." /></label>{chatError && <p className="form-error" role="alert">{chatError}</p>}<button className="dark-button" type="submit" disabled={chatLoading || chatRestoreLoading || chatResponse?.status === 'approval_required'}>{chatLoading ? 'Thinking…' : 'Ask assistant'} <span>→</span></button></form>
         </div>
       </div>}
       {accountModalOpen && <CreateAccountModal token={token} patients={patients} onClose={() => setAccountModalOpen(false)} onCreated={(user) => setUsers((current) => [...current, user])} />}

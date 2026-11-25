@@ -151,16 +151,18 @@ def get_payments(
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
-    payments = db.query(Payment).all()
+    if current_user.role == "clinician":
+        raise HTTPException(status_code=403, detail="Finance record access is restricted")
+    if current_user.role not in ("patient", "staff", "admin"):
+        raise HTTPException(status_code=403, detail="Finance record access is restricted")
+
+    query = db.query(Payment)
     if current_user.role == "patient":
         owned_patient = db.query(Patient).filter(Patient.user_id == current_user.id).first()
         if not owned_patient:
             return []
-        owned_bill_ids = [
-            bill.id
-            for bill in db.query(Bill).filter(Bill.patient_id == owned_patient.id).all()
-        ]
-        payments = [payment for payment in payments if payment.bill_id in owned_bill_ids]
+        query = query.join(Bill, Payment.bill_id == Bill.id).filter(Bill.patient_id == owned_patient.id)
+    payments = query.all()
 
     return [
         {
@@ -186,21 +188,24 @@ def get_payment(
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
-    payment = db.query(Payment).filter(
-        Payment.id == payment_id
-    ).first()
+    if current_user.role == "clinician":
+        raise HTTPException(status_code=403, detail="Finance record access is restricted")
+    if current_user.role not in ("patient", "staff", "admin"):
+        raise HTTPException(status_code=403, detail="Finance record access is restricted")
+
+    query = db.query(Payment).filter(Payment.id == payment_id)
+    if current_user.role == "patient":
+        owned_patient = db.query(Patient).filter(Patient.user_id == current_user.id).first()
+        if not owned_patient:
+            raise HTTPException(status_code=404, detail="Payment not found")
+        query = query.join(Bill, Payment.bill_id == Bill.id).filter(Bill.patient_id == owned_patient.id)
+    payment = query.first()
 
     if not payment:
         raise HTTPException(
             status_code=404,
             detail="Payment not found"
         )
-    if current_user.role == "patient":
-        owned_patient = db.query(Patient).filter(Patient.user_id == current_user.id).first()
-        bill = db.query(Bill).filter(Bill.id == payment.bill_id).first()
-        if not owned_patient or not bill or bill.patient_id != owned_patient.id:
-            raise HTTPException(status_code=403, detail="You can only access your own payments")
-
     return {
         "id": payment.id,
         "bill_id": payment.bill_id,

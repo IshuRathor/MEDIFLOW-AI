@@ -4,6 +4,19 @@ from time import perf_counter
 from typing import Callable, Literal
 
 from fastapi import HTTPException
+from sqlalchemy.orm import Session, sessionmaker
+from app.database.db import SessionLocal
+
+
+_TOOL_EXECUTOR = ThreadPoolExecutor(max_workers=8, thread_name_prefix="ai-tool")
+
+
+@dataclass(frozen=True)
+class _ToolUserContext:
+    """Detached authorization context safe to pass to a worker thread."""
+
+    id: int | None
+    role: str
 
 
 @dataclass(frozen=True)
@@ -17,8 +30,61 @@ class Tool:
 
 
 class ToolRegistry:
-    def __init__(self) -> None:
+    def __init__(
+        self,
+        session_factory: Callable | None = None,
+        timeout_seconds: float = 5.0,
+        executor: ThreadPoolExecutor | None = None,
+    ) -> None:
         self._tools: dict[str, Tool] = {}
+        self._session_factory = session_factory or SessionLocal
+        self._custom_session_factory = session_factory is not None
+        self._timeout_seconds = timeout_seconds
+        self._executor = executor or _TOOL_EXECUTOR
+
+    def _session_factory_for(self, request_db) -> Callable:
+        # Use the request's configured engine (including test dependency
+        # overrides), while creating an independent Session for the worker.
+        if not self._custom_session_factory and isinstance(request_db, Session):
+            return sessionmaker(
+                bind=request_db.get_bind(),
+                autocommit=False,
+                autoflush=False,
+            )
+        return self._session_factory
+
+    def _invoke(
+        self,
+        tool: Tool,
+        user: _ToolUserContext,
+        parameters: dict,
+        session_factory: Callable,
+    ) -> dict:
+        """Run one handler with a thread-owned session and bounded transaction."""
+        session = session_factory()
+        try:
+            result = tool.handler(db=session, user=user, **parameters)
+            if not isinstance(result, dict):
+                raise ValueError("Tool result must be a dictionary")
+            if "status" not in result:
+                result = {"status": "success", **result}
+            if result["status"] not in {
+                "success",
+                "error",
+                "clarification_required",
+            }:
+                raise ValueError("Tool returned an invalid status")
+
+            if result["status"] == "success":
+                session.commit()
+            else:
+                session.rollback()
+            return result
+        except BaseException:
+            session.rollback()
+            raise
+        finally:
+            session.close()
 
     def register(
         self,
@@ -101,6 +167,8 @@ class ToolRegistry:
         db,
         parameters: dict,
     ) -> tuple[dict, dict]:
+        # Keep db in the public signature for callers, but never pass this
+        # request-scoped session into a worker thread.
         tool = self._tools.get(name)
         if tool is None:
             return (
@@ -126,34 +194,46 @@ class ToolRegistry:
 
         started = perf_counter()
         attempts = 2 if tool.kind == "read" else 1
+        worker_user = _ToolUserContext(
+            id=getattr(user, "id", None),
+            role=user.role,
+        )
+        worker_session_factory = self._session_factory_for(db)
 
         for attempt in range(attempts):
             try:
-                executor = ThreadPoolExecutor(max_workers=1)
-                future = executor.submit(
-                    tool.handler,
-                    db=db,
-                    user=user,
-                    **parameters,
+                future = self._executor.submit(
+                    self._invoke,
+                    tool,
+                    worker_user,
+                    parameters,
+                    worker_session_factory,
                 )
                 try:
-                    result = future.result(timeout=5.0)
+                    result = future.result(timeout=self._timeout_seconds)
                 except FuturesTimeout:
-                    future.cancel()
-                    raise TimeoutError
-                finally:
-                    executor.shutdown(wait=False, cancel_futures=True)
-
-                if not isinstance(result, dict):
-                    raise ValueError("Tool result must be a dictionary")
-                if "status" not in result:
-                    result = {"status": "success", **result}
-                if result["status"] not in {
-                    "success",
-                    "error",
-                    "clarification_required",
-                }:
-                    raise ValueError("Tool returned an invalid status")
+                    # cancel() only prevents work that has not started. A running
+                    # handler owns its session until it returns and _invoke closes it.
+                    cancelled_before_start = future.cancel()
+                    message = "The tool timed out."
+                    outcome = None
+                    if tool.kind == "approval_write":
+                        if cancelled_before_start:
+                            message = "The operation did not start before timing out. You can retry."
+                        else:
+                            message = (
+                                "The operation timed out and may still be processing. "
+                                "Its outcome is unknown; check its status before retrying."
+                            )
+                            outcome = "unknown"
+                    timeout_result = {"status": "error", "message": message}
+                    if outcome:
+                        timeout_result["outcome"] = outcome
+                    return timeout_result, {
+                        "tool": name,
+                        "status": "error",
+                        "duration_ms": round((perf_counter() - started) * 1000, 2),
+                    }
 
                 trace_status = (
                     "success"
@@ -168,20 +248,6 @@ class ToolRegistry:
                         2,
                     ),
                 }
-            except TimeoutError:
-                if attempt + 1 < attempts:
-                    continue
-                return (
-                    {"status": "error", "message": "The tool timed out."},
-                    {
-                        "tool": name,
-                        "status": "error",
-                        "duration_ms": round(
-                            (perf_counter() - started) * 1000,
-                            2,
-                        ),
-                    },
-                )
             except HTTPException as exc:
                 return (
                     {"status": "error", "message": exc.detail},

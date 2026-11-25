@@ -15,6 +15,8 @@ from app.models.patient import Patient
 from app.models.user import User
 from app.models.availability import DoctorAvailability
 from app.models.audit import AuditLog
+from app.services.cancellation import PENDING_CANCELLATION
+from app.services.finance_analytics import amount_series, bill_balances, finance_today, recorded_total
 
 
 router = APIRouter(prefix="/dashboard", tags=["Dashboard"])
@@ -40,6 +42,7 @@ def _appointment_item(appointment: Appointment, db: Session):
         "status": appointment.status,
         "notes": appointment.notes,
         "decline_reason": appointment.decline_reason,
+        "cancellation_status": appointment.cancellation_status,
         "created_at": appointment.created_at.isoformat() if appointment.created_at else None,
         "department": doctor.department if doctor else None,
     }
@@ -66,6 +69,10 @@ def get_dashboard_metrics(
     outstanding_query = db.query(func.count(Bill.id)).filter(
         Bill.status.in_(("Pending", "Partially Paid"))
     )
+    # Keep patient-facing finance metrics explicitly zero; do not leak totals.
+    doctors_registered = 0
+    recorded_billing = 0
+    outstanding_bills = 0
     if current_user.role == "patient":
         owned_patient = db.query(Patient).filter(Patient.user_id == current_user.id).first()
         if owned_patient:
@@ -171,6 +178,19 @@ def doctor_dashboard(db: Session = Depends(get_db), current_user: User = Depends
             if item.status == "Pending Doctor Approval"
         ],
         "recent_visits": [_appointment_item(item, db) for item in recent],
+        "cancellation_requests": [
+            {
+                "id": item.id,
+                "request_id": item.cancellation_request_id,
+                "patient_name": item.patient.name,
+                "appointment_date": item.appointment_date.isoformat(),
+                "requested_at": _as_naive_utc(item.cancellation_requested_at).replace(tzinfo=timezone.utc).isoformat(),
+                "status": item.cancellation_status,
+                "can_approve": _as_naive_utc(item.appointment_date) > datetime.now(),
+            }
+            for item in sorted(all_appointments, key=lambda item: item.cancellation_requested_at or item.appointment_date, reverse=True)
+            if item.cancellation_status == PENDING_CANCELLATION
+        ],
         "past_appointments": [_appointment_item(item, db) for item in past_appointments[:10]],
         "assigned_patients": [
             {"id": patient.id, "name": patient.name, "email": patient.email, "phone": patient.phone}
@@ -230,6 +250,16 @@ def patient_dashboard(db: Session = Depends(get_db), current_user: User = Depend
         "declined": [_appointment_item(item, db) for item in declined],
         "cancelled": [_appointment_item(item, db) for item in cancelled],
         "previous": [_appointment_item(item, db) for item in previous[:8]],
+        "cancellation_history": [
+            {
+                "doctor_name": item.doctor.name,
+                "appointment_date": item.appointment_date.isoformat(),
+                "status": item.status,
+                "cancellation_status": item.cancellation_status,
+                "cancellation_reason": item.cancellation_reason,
+            }
+            for item in appointments if item.cancellation_status
+        ],
         "assigned_doctor": assigned_doctor,
         "bills": [
             {"id": bill.id, "bill_number": bill.bill_number, "total_amount": float(bill.total_amount), "status": bill.status, "created_at": bill.created_at.isoformat()}
@@ -249,29 +279,22 @@ def finance_dashboard(db: Session = Depends(get_db), current_user: User = Depend
     if current_user.role != "staff":
         raise HTTPException(status_code=403, detail="Finance staff dashboard access is required")
 
-    today = date.today()
-    today_start = datetime.combine(today, time.min)
-    tomorrow_start = today_start + timedelta(days=1)
-    month_start = today.replace(day=1)
-    month_start_datetime = datetime.combine(month_start, time.min)
-
-    completed_payments = db.query(Payment).filter(Payment.payment_status == "Completed").all()
-    today_payments = [payment for payment in completed_payments if today_start <= _as_naive_utc(payment.paid_at) < tomorrow_start]
-    month_payments = [payment for payment in completed_payments if _as_naive_utc(payment.paid_at) >= month_start_datetime]
-    bills = db.query(Bill).order_by(Bill.created_at.desc()).all()
-    outstanding_bills = [bill for bill in bills if bill.status in ("Pending", "Partially Paid")]
+    today = finance_today()
+    tomorrow = today + timedelta(days=1)
+    (daily, monthly), _ = amount_series(db, [(today, tomorrow), (today.replace(day=1), tomorrow)])
+    balances = bill_balances(db, tomorrow)
 
     recent_payments = db.query(Payment).order_by(Payment.paid_at.desc()).limit(10).all()
     return {
         "role": "staff",
         "stats": {
-            "total_revenue": float(sum((payment.amount for payment in completed_payments), 0)),
-            "todays_collections": float(sum((payment.amount for payment in today_payments), 0)),
-            "monthly_revenue": float(sum((payment.amount for payment in month_payments), 0)),
-            "pending_payments": sum(1 for bill in bills if bill.status in ("Pending", "Partially Paid")),
-            "outstanding_bills": float(sum((bill.total_amount for bill in outstanding_bills), 0)),
-            "total_bills_generated": len(bills),
-            "completed_payments": len(completed_payments),
+            "total_revenue": float(recorded_total(db, end=tomorrow)),
+            "todays_collections": float(daily),
+            "monthly_revenue": float(monthly),
+            "pending_payments": balances["unpaid"] + balances["partial"],
+            "outstanding_bills": float(balances["outstanding"]),
+            "total_bills_generated": db.query(Bill).count(),
+            "completed_payments": db.query(Payment).filter(Payment.payment_status == "Completed").count(),
         },
         "recent_transactions": [
             {

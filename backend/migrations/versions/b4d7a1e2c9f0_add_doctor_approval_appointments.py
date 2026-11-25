@@ -15,10 +15,19 @@ depends_on: Union[str, Sequence[str]] = None
 
 
 def upgrade() -> None:
+    # Some deployed databases have the previous slot constraints under
+    # different names (or were created without them). Only drop the legacy
+    # indexes when they exist; the active-slot indexes below are authoritative.
+    bind = op.get_bind()
+    existing_indexes = {
+        index["name"] for index in sa.inspect(bind).get_indexes("appointments")
+    }
     with op.batch_alter_table("appointments") as batch_op:
         batch_op.add_column(sa.Column("decline_reason", sa.String(), nullable=True))
-        batch_op.drop_index("uq_scheduled_doctor_slot")
-        batch_op.drop_index("uq_scheduled_patient_slot")
+        if "uq_scheduled_doctor_slot" in existing_indexes:
+            batch_op.drop_index("uq_scheduled_doctor_slot")
+        if "uq_scheduled_patient_slot" in existing_indexes:
+            batch_op.drop_index("uq_scheduled_patient_slot")
         batch_op.create_index(
             "uq_active_doctor_slot",
             ["doctor_id", "appointment_date"],

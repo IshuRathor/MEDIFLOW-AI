@@ -103,6 +103,11 @@ def get_bills(
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
+    if current_user.role == "clinician":
+        raise HTTPException(status_code=403, detail="Finance record access is restricted")
+    if current_user.role not in ("patient", "staff", "admin"):
+        raise HTTPException(status_code=403, detail="Finance record access is restricted")
+
     query = db.query(Bill)
     if current_user.role == "patient":
         owned_patient = db.query(Patient).filter(Patient.user_id == current_user.id).first()
@@ -139,20 +144,24 @@ def get_bill(
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
-    bill = db.query(Bill).filter(
-        Bill.id == bill_id
-    ).first()
+    if current_user.role == "clinician":
+        raise HTTPException(status_code=403, detail="Finance record access is restricted")
+    if current_user.role not in ("patient", "staff", "admin"):
+        raise HTTPException(status_code=403, detail="Finance record access is restricted")
+
+    query = db.query(Bill).filter(Bill.id == bill_id)
+    if current_user.role == "patient":
+        owned_patient = db.query(Patient).filter(Patient.user_id == current_user.id).first()
+        if not owned_patient:
+            raise HTTPException(status_code=404, detail="Bill not found")
+        query = query.filter(Bill.patient_id == owned_patient.id)
+    bill = query.first()
 
     if not bill:
         raise HTTPException(
             status_code=404,
             detail="Bill not found"
         )
-    if current_user.role == "patient":
-        owned_patient = db.query(Patient).filter(Patient.user_id == current_user.id).first()
-        if not owned_patient or bill.patient_id != owned_patient.id:
-            raise HTTPException(status_code=403, detail="You can only access your own bills")
-
     return {
         "id": bill.id,
         "patient_id": bill.patient_id,

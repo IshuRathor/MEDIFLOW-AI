@@ -1,5 +1,6 @@
 import unittest
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, timedelta, timezone
+from decimal import Decimal
 from unittest.mock import patch
 from concurrent.futures import ThreadPoolExecutor
 import os
@@ -19,6 +20,7 @@ from app.models.patient import Patient
 from app.models.doctor import Doctor
 from app.models.appointment import Appointment
 from app.models.availability import DoctorAvailability
+from app.models.finance import Bill, Expense, Payment
 from app.main import app
 from app.core import security
 from app.api import appointment, availability, bills, doctor, patients, payments
@@ -377,7 +379,7 @@ class ApiIntegrationTests(unittest.TestCase):
             first = self.client.post(
                 "/api/ai/chat",
                 headers=patient_headers,
-                json={"query": f"I want to book an appointment with Dr. Ritik on {target.isoformat()} at 4 PM for a headache"},
+                json={"query": f"Could you arrange a visit with Dr. Ritik on {target.isoformat()} at 4 PM for a headache"},
             )
         self.assertEqual(first.status_code, 200)
         self.assertEqual(first.json()["status"], "approval_required")
@@ -408,6 +410,7 @@ class ApiIntegrationTests(unittest.TestCase):
             db.flush()
             db.add(DoctorAvailability(doctor_id=doctor.id, day_of_week=target.strftime("%A"), specific_date=target, start_time=datetime.strptime("09:00", "%H:%M").time(), end_time=datetime.strptime("10:00", "%H:%M").time(), is_available=True))
             db.commit()
+            doctor_id = doctor.id
         finally:
             db.close()
 
@@ -419,7 +422,14 @@ class ApiIntegrationTests(unittest.TestCase):
         self.assertEqual(doctor_search.json()["data"]["doctors"][0]["name"], "Context Doctor")
         first = self.client.post("/api/ai/chat", headers=headers, json={"query": "I want to book an appointment"})
         self.assertEqual(first.json()["status"], "clarification_required")
-        self.assertTrue(first.json()["data"]["doctors"])
+        doctor_cards = first.json()["data"]["doctors"]
+        self.assertTrue(doctor_cards)
+        self.assertEqual(doctor_cards[0]["id"], doctor_id)
+        self.assertEqual(doctor_cards[0]["name"], "Context Doctor")
+        self.assertEqual(doctor_cards[0]["specialization"], "Cardiology")
+        self.assertEqual(doctor_cards[0]["department"], "Heart")
+        self.assertIn("Choose a doctor", first.json()["message"])
+        self.assertNotIn("ID", first.json()["message"])
         conversation_id = first.json()["conversation_id"]
 
         def ask(text):
@@ -427,22 +437,39 @@ class ApiIntegrationTests(unittest.TestCase):
 
         doctor_choice = ask("Dr. Context Doctor")
         self.assertIn("What date", doctor_choice.json()["message"])
+        self.assertEqual(doctor_choice.json()["data"]["doctor"]["name"], "Context Doctor")
         date_choice = ask(target.isoformat())
         self.assertIn("Available slots", date_choice.json()["message"])
         time_choice = ask("9 AM")
-        self.assertIn("reason for this appointment", time_choice.json()["message"])
-        summary = ask("headache")
-        self.assertEqual(summary.json()["status"], "approval_required")
-        self.assertIn("Confirm to submit", summary.json()["message"])
+        self.assertEqual(time_choice.json()["status"], "approval_required")
+        self.assertIn("General consultation", time_choice.json()["message"])
+        self.assertIn("Confirm to submit", time_choice.json()["message"])
+
+        pending_snapshot = self.client.get("/api/ai/conversations/latest", headers=headers)
+        self.assertEqual(pending_snapshot.status_code, 200)
+        pending_body = pending_snapshot.json()
+        self.assertEqual(pending_body["conversation_id"], conversation_id)
+        self.assertEqual(pending_body["pending_approval"]["id"], time_choice.json()["approval_id"])
+        self.assertEqual(pending_body["last_response"]["status"], "approval_required")
+        self.assertEqual(pending_body["last_response"]["data"]["date"], target.isoformat())
+        self.assertEqual(pending_body["last_response"]["data"]["time"], "09:00")
+        self.assertEqual(pending_body["last_response"]["data"]["doctor"]["name"], "Context Doctor")
+        self.assertNotIn("patient_id", pending_body["last_response"]["data"])
+        self.assertNotIn("reason", pending_body["last_response"]["data"])
+        self.assertTrue(any(item["content"] == "Dr. Context Doctor" for item in pending_body["messages"]))
+        self.assertTrue(any(item["content"] == target.isoformat() for item in pending_body["messages"]))
 
         db = self.session_factory()
         try:
             self.assertEqual(db.query(Appointment).count(), 0)
         finally:
             db.close()
-        submitted = self.client.post(f"/api/ai/approvals/{summary.json()['approval_id']}/approve", headers=headers)
+        submitted = self.client.post(f"/api/ai/approvals/{time_choice.json()['approval_id']}/approve", headers=headers)
         self.assertEqual(submitted.status_code, 200)
         self.assertEqual(submitted.json()["result"]["status"], "Pending Doctor Approval")
+        completed_snapshot = self.client.get("/api/ai/conversations/latest", headers=headers).json()
+        self.assertIsNone(completed_snapshot["pending_approval"])
+        self.assertIn("waiting for doctor approval", completed_snapshot["messages"][-1]["content"].lower())
 
     def test_available_slot_booking_succeeds_with_confirmation_data(self):
         db = self.session_factory()
@@ -903,6 +930,120 @@ class ApiIntegrationTests(unittest.TestCase):
         finally:
             audit_db.close()
 
+    def test_billing_and_payment_reads_are_scoped_by_role(self):
+        db = self.session_factory()
+        try:
+            patient_users = [
+                User(full_name=f"Finance Patient {index}", email=f"finance.patient{index}@example.com", password_hash=security.hash_password("patient-password"), role="patient", is_active=True, approval_status="approved")
+                for index in (1, 2)
+            ]
+            staff_user = User(full_name="Finance Staff", email="finance.staff@example.com", password_hash=security.hash_password("staff-password"), role="staff", is_active=True, approval_status="approved")
+            clinician_user = User(full_name="Finance Clinician", email="finance.clinician@example.com", password_hash=security.hash_password("clinician-password"), role="clinician", is_active=True, approval_status="approved")
+            db.add_all([*patient_users, staff_user, clinician_user])
+            db.flush()
+            patient_profiles = [
+                Patient(name=f"Finance Patient {index}", age=30 + index, email=f"finance.patient{index}@example.com", user_id=user.id)
+                for index, user in enumerate(patient_users, start=1)
+            ]
+            db.add_all(patient_profiles)
+            db.flush()
+            bills = [
+                Bill(patient_id=patient_profiles[index].id, bill_number=f"FIN-{index + 1}", total_amount=100 + index, status="Pending")
+                for index in range(2)
+            ]
+            db.add_all(bills)
+            db.flush()
+            payments = [
+                Payment(bill_id=bill.id, amount=50, payment_method="Card", payment_status="Completed", transaction_reference=f"FIN-REF-{index + 1}")
+                for index, bill in enumerate(bills)
+            ]
+            db.add_all(payments)
+            db.commit()
+            bill_ids = [bill.id for bill in bills]
+            payment_ids = [payment.id for payment in payments]
+        finally:
+            db.close()
+
+        def login(email, password):
+            response = self.client.post("/api/auth/login", json={"email": email, "password": password})
+            self.assertEqual(response.status_code, 200)
+            return {"Authorization": f"Bearer {response.json()['access_token']}"}
+
+        patient_one = login("finance.patient1@example.com", "patient-password")
+        own_bills = self.client.get("/api/bills/", headers=patient_one)
+        own_payments = self.client.get("/api/payments/", headers=patient_one)
+        self.assertEqual(own_bills.status_code, 200)
+        self.assertEqual([item["id"] for item in own_bills.json()], [bill_ids[0]])
+        self.assertEqual(own_payments.status_code, 200)
+        self.assertEqual([item["id"] for item in own_payments.json()], [payment_ids[0]])
+        self.assertEqual(self.client.get(f"/api/bills/{bill_ids[0]}", headers=patient_one).status_code, 200)
+        self.assertEqual(self.client.get(f"/api/payments/{payment_ids[0]}", headers=patient_one).status_code, 200)
+        self.assertEqual(self.client.get(f"/api/bills/{bill_ids[1]}", headers=patient_one).status_code, 404)
+        self.assertEqual(self.client.get(f"/api/payments/{payment_ids[1]}", headers=patient_one).status_code, 404)
+
+        clinician = login("finance.clinician@example.com", "clinician-password")
+        self.assertEqual(self.client.get("/api/bills/", headers=clinician).status_code, 403)
+        self.assertEqual(self.client.get("/api/payments/", headers=clinician).status_code, 403)
+        self.assertEqual(self.client.get(f"/api/bills/{bill_ids[0]}", headers=clinician).status_code, 403)
+        self.assertEqual(self.client.get(f"/api/payments/{payment_ids[0]}", headers=clinician).status_code, 403)
+
+        for authorized_finance_user in (
+            login("finance.staff@example.com", "staff-password"),
+            self.headers,
+        ):
+            finance_bills = self.client.get("/api/bills/", headers=authorized_finance_user)
+            finance_payments = self.client.get("/api/payments/", headers=authorized_finance_user)
+            self.assertEqual(finance_bills.status_code, 200)
+            self.assertEqual({item["id"] for item in finance_bills.json()}, set(bill_ids))
+            self.assertEqual(finance_payments.status_code, 200)
+            self.assertEqual({item["id"] for item in finance_payments.json()}, set(payment_ids))
+            for bill_id, payment_id in zip(bill_ids, payment_ids):
+                self.assertEqual(self.client.get(f"/api/bills/{bill_id}", headers=authorized_finance_user).status_code, 200)
+                self.assertEqual(self.client.get(f"/api/payments/{payment_id}", headers=authorized_finance_user).status_code, 200)
+
+    def test_dashboard_metrics_return_role_safe_fields(self):
+        db = self.session_factory()
+        try:
+            patient_user = User(full_name="Metrics Patient", email="metrics.patient@example.com", password_hash=security.hash_password("patient-password"), role="patient", is_active=True, approval_status="approved")
+            clinician_user = User(full_name="Metrics Clinician", email="metrics.clinician@example.com", password_hash=security.hash_password("clinician-password"), role="clinician", is_active=True, approval_status="approved")
+            staff_user = User(full_name="Metrics Staff", email="metrics.staff@example.com", password_hash=security.hash_password("staff-password"), role="staff", is_active=True, approval_status="approved")
+            db.add_all([patient_user, clinician_user, staff_user])
+            db.flush()
+            db.add_all([
+                Patient(name="Metrics Patient", age=28, email="metrics.patient@example.com", user_id=patient_user.id),
+                Doctor(name="Metrics Clinician", specialization="Cardiology", email="metrics.doctor@example.com", user_id=clinician_user.id),
+            ])
+            db.commit()
+        finally:
+            db.close()
+
+        def login(email, password):
+            response = self.client.post("/api/auth/login", json={"email": email, "password": password})
+            self.assertEqual(response.status_code, 200)
+            return {"Authorization": f"Bearer {response.json()['access_token']}"}
+
+        self.assertEqual(self.client.get("/api/dashboard/metrics").status_code, 401)
+        patient_metrics = self.client.get("/api/dashboard/metrics", headers=login("metrics.patient@example.com", "patient-password"))
+        self.assertEqual(patient_metrics.status_code, 200)
+        self.assertEqual(patient_metrics.json()["doctors_registered"], 0)
+        self.assertEqual(float(patient_metrics.json()["recorded_billing"]), 0)
+        self.assertEqual(patient_metrics.json()["outstanding_bills"], 0)
+
+        clinician_metrics = self.client.get("/api/dashboard/metrics", headers=login("metrics.clinician@example.com", "clinician-password"))
+        self.assertEqual(clinician_metrics.status_code, 200)
+        self.assertEqual(clinician_metrics.json()["doctors_registered"], 1)
+        self.assertEqual(float(clinician_metrics.json()["recorded_billing"]), 0)
+        self.assertEqual(clinician_metrics.json()["outstanding_bills"], 0)
+
+        staff_metrics = self.client.get("/api/dashboard/metrics", headers=login("metrics.staff@example.com", "staff-password"))
+        admin_metrics = self.client.get("/api/dashboard/metrics", headers=self.headers)
+        for response in (staff_metrics, admin_metrics):
+            self.assertEqual(response.status_code, 200)
+            self.assertEqual(set(response.json()), {
+                "appointments_today", "patients_registered", "doctors_registered",
+                "recorded_billing", "outstanding_bills",
+            })
+
     def test_list_endpoints_support_search_filtering_and_pagination(self):
         for name, email in (
             ("Searchable Patient", "searchable@example.com"),
@@ -994,7 +1135,75 @@ class ApiIntegrationTests(unittest.TestCase):
 
         self.assertEqual(support.status_code, 200)
         self.assertEqual(support.json()["status"], "clarification_required")
-        self.assertIn("appointment id", support.json()["message"].lower())
+        self.assertIn("appointment", support.json()["message"].lower())
+        self.assertIn("cancelling", support.json()["message"].lower())
+
+    def test_customer_support_guidance_and_authenticated_appointment_status(self):
+        class NoToolCalls:
+            function_calls = []
+            text = ""
+
+        guidance_cases = (
+            ("How do I book an appointment?", "appointment_booking", "wait for your confirmation"),
+            ("I have a problem with my appointment", "appointment_support", "cancelling"),
+            ("How can I cancel an appointment?", "appointment_cancellation", "appointment number"),
+            ("I can't log in to my account", "login_registration", "self-service password reset"),
+            ("How do I register?", "login_registration", "administrator approval"),
+            ("Where is my dashboard?", "dashboard_navigation", "Accounts"),
+            ("Is Dr Smith available?", "doctor_availability", "schedule on file"),
+            ("The technical error is not working", "technical_support", "verified channel"),
+        )
+        with patch("app.ai.orchestrator._gemini_response", return_value=NoToolCalls()):
+            for query, expected_category, expected_text in guidance_cases:
+                response = self.client.post("/api/ai/chat", headers=self.headers, json={"query": query})
+                self.assertEqual(response.status_code, 200, query)
+                self.assertEqual(response.json()["agent"], "Customer Support Agent", query)
+                support_result = response.json()["data"]["tool_results"][0]["result"]
+                self.assertEqual(support_result["category"], expected_category, query)
+                self.assertIn(expected_text.lower(), response.json()["message"].lower(), query)
+
+            unknown = self.client.post(
+                "/api/ai/chat",
+                headers=self.headers,
+                json={"query": "What is the weather on Neptune?"},
+            )
+        self.assertEqual(unknown.status_code, 200)
+        self.assertEqual(unknown.json()["agent"], "Customer Support Agent")
+        self.assertEqual(unknown.json()["status"], "clarification_required")
+
+        db = self.session_factory()
+        try:
+            patient_user = User(full_name="Support Patient", email="support.patient@example.com", password_hash=security.hash_password("patient-password"), role="patient", is_active=True, approval_status="approved")
+            clinician_user = User(full_name="Support Clinician", email="support.clinician@example.com", password_hash=security.hash_password("doctor-password"), role="clinician", is_active=True, approval_status="approved")
+            db.add_all([patient_user, clinician_user])
+            db.flush()
+            patient = Patient(name="Support Patient", age=30, email="support.patient@example.com", user_id=patient_user.id)
+            doctor = Doctor(name="Support Clinician", specialization="Cardiology", email="support.clinician.profile@example.com", user_id=clinician_user.id)
+            db.add_all([patient, doctor])
+            db.flush()
+            appointment = Appointment(patient_id=patient.id, doctor_id=doctor.id, appointment_date=datetime.now() + timedelta(days=14), status="Pending Doctor Approval")
+            db.add(appointment)
+            db.commit()
+            appointment_id = appointment.id
+        finally:
+            db.close()
+
+        patient_login = self.client.post("/api/auth/login", json={"email": "support.patient@example.com", "password": "patient-password", "role": "patient"})
+        clinician_login = self.client.post("/api/auth/login", json={"email": "support.clinician@example.com", "password": "doctor-password", "role": "clinician"})
+        self.assertEqual(patient_login.status_code, 200)
+        self.assertEqual(clinician_login.status_code, 200)
+        patient_headers = {"Authorization": f"Bearer {patient_login.json()['access_token']}"}
+        clinician_headers = {"Authorization": f"Bearer {clinician_login.json()['access_token']}"}
+
+        with patch("app.ai.orchestrator._gemini_response", return_value=NoToolCalls()):
+            patient_status = self.client.post("/api/ai/chat", headers=patient_headers, json={"query": "What is my appointment status?"})
+            clinician_dashboard = self.client.post("/api/ai/chat", headers=clinician_headers, json={"query": "How do I find my dashboard?"})
+        self.assertEqual(patient_status.status_code, 200)
+        history_result = patient_status.json()["data"]["tool_results"][0]["result"]["appointments"]
+        self.assertEqual([item["id"] for item in history_result], [appointment_id])
+        self.assertEqual(history_result[0]["status"], "Pending Doctor Approval")
+        self.assertEqual(clinician_dashboard.status_code, 200)
+        self.assertIn("clinician Overview", clinician_dashboard.json()["message"])
 
     def test_pending_bills_use_completed_payment_balance(self):
         patient = self.client.post(
@@ -1081,6 +1290,153 @@ class ApiIntegrationTests(unittest.TestCase):
         self.assertEqual(approved.status_code, 200)
         self.assertEqual(approved.json()["status"], "executed")
         self.assertIn("bill_id", approved.json()["result"])
+
+    def test_finance_analytics_reports_use_authorized_decimal_aggregates(self):
+        headers, appointments, _, _ = self._cancellation_fixture()
+        staff = headers["staff"]
+        self.enterContext(patch("app.services.finance_analytics.finance_today", return_value=date(2026, 11, 25)))
+        gemini = self.enterContext(patch("app.ai.orchestrator._gemini_response", side_effect=ConnectionError("offline")))
+
+        def ask(query, actor=staff):
+            response = self.client.post("/api/ai/chat", headers=actor, json={"query": query, "role": "admin"})
+            self.assertEqual(response.status_code, 200, response.text)
+            return response.json()
+
+        def report(query, actor=staff):
+            result = ask(query, actor)
+            self.assertEqual(result["status"], "completed", result)
+            self.assertEqual(result["agent"], "Finance Agent")
+            self.assertEqual(result["trace"][0]["tool"], "finance_analytics")
+            self.assertIsNone(result["approval_id"])
+            return result["data"]["finance_report"]
+
+        def metrics(result):
+            return {item["label"]: Decimal(item["value"]) if item["value"] is not None else None for item in result["metrics"]}
+
+        empty = report("Show monthly collections for the last 12 months")
+        self.assertEqual(len(empty["charts"][0]["labels"]), 12)
+        self.assertFalse(empty["charts"][0]["has_activity"])
+        self.assertEqual(metrics(empty)["Total completed collections"], 0)
+        self.assertIsNone(metrics(report("Compare this month with last month"))["Collections change (%)"])
+        unavailable = report("Forecast next month's collections")
+        self.assertIsNone(metrics(unavailable)["Baseline forecast"])
+        self.assertIn("Forecast unavailable", " ".join(unavailable["notes"]))
+
+        with self.session_factory() as db:
+            patient_id = db.get(Appointment, appointments["own"]).patient_id
+            bills = [
+                Bill(patient_id=patient_id, bill_number=number, total_amount=amount, status=status, created_at=datetime(2026, 5, 1))
+                for number, amount, status in (
+                    ("ANALYTICS-PARTIAL", 500, "Partially Paid"),
+                    ("ANALYTICS-UNPAID", 200, "Pending"),
+                    ("ANALYTICS-CANCELLED", 1000, "Cancelled"),
+                )
+            ]
+            db.add_all(bills)
+            db.flush()
+            bill_id = bills[0].id
+            for when, amount, status in (
+                (datetime(2026, 7, 5), "20.00", "Completed"),
+                (datetime(2026, 10, 1), "100.10", "Completed"),
+                (datetime(2026, 10, 31, 18, 29), "25.10", "Completed"),
+                (datetime(2026, 10, 31, 18, 30), "50.30", "Completed"),
+                (datetime(2026, 11, 24), "30.20", "Completed"),
+                (datetime(2026, 11, 25), "90.10", "Completed"),
+                (datetime(2026, 11, 25), "999.00", "Failed"),
+            ):
+                db.add(Payment(bill_id=bill_id, amount=Decimal(amount), payment_method="Cash", payment_status=status, paid_at=when))
+            for day, category, amount in ((date(2026, 11, 1), "Supplies", 10),
+                                          (date(2026, 11, 24), "Supplies", 20),
+                                          (date(2026, 11, 25), "Utilities", 15)):
+                db.add(Expense(description="Fixture expense", category=category, amount=amount, payment_method="Cash", expense_date=day))
+            db.commit()
+
+        month = report("Show total revenue this month")
+        self.assertEqual(month["timezone"], "Asia/Kolkata")
+        self.assertEqual(month["currency"], "INR")
+        self.assertEqual(metrics(month)["Total completed collections"], Decimal("170.60"))
+        history = report("Show monthly collections for the last 12 months", self.headers)
+        self.assertEqual(history["charts"][0]["series"][0]["values"][-2:], ["125.20", "170.60"])
+        self.assertEqual(report("Show daily collections today")["charts"][0]["series"][0]["values"], ["90.10"])
+        self.assertEqual(report("Show weekly collections")["charts"][0]["kind"], "line")
+        categories = report("Which expense category costs us the most?")
+        self.assertEqual(categories["charts"][0]["labels"], ["Supplies", "Utilities"])
+        self.assertEqual(categories["charts"][0]["series"][0]["values"], ["30.00", "15.00"])
+        performance = report("Compare revenue and expenses this month")
+        self.assertEqual([chart["kind"] for chart in performance["charts"]], ["bar", "line"])
+        self.assertEqual(metrics(performance)["Total recorded expenses"], 45)
+        self.assertEqual(metrics(performance)["Recorded financial movement"], Decimal("125.60"))
+        balance = report("Show outstanding payments")
+        self.assertEqual(metrics(balance), {
+            "Paid amount applied": Decimal("315.80"), "Outstanding amount": Decimal("384.20"),
+            "Unpaid bills": 1, "Partially paid bills": 1,
+        })
+        dashboard = self.client.get("/api/dashboard/finance", headers=staff).json()
+        self.assertEqual(dashboard["stats"]["outstanding_bills"], 384.20)
+        monthly = report("Compare this month with last month")
+        self.assertEqual(monthly["charts"][0]["labels"], ["2026-11-01 to 2026-11-24", "2026-10-01 to 2026-10-24"])
+        self.assertEqual(metrics(monthly)["Collections change"], Decimal("-19.60"))
+        self.assertEqual(metrics(monthly)["Collections change (%)"], Decimal("-19.58"))
+        quarterly = report("Show quarterly financial performance")
+        self.assertEqual(quarterly["charts"][0]["series"][0]["values"], ["205.70", "20.00"])
+        self.assertEqual(metrics(quarterly)["Collections change"], Decimal("185.70"))
+        restored = self.client.get("/api/ai/conversations/latest", headers=staff).json()
+        self.assertEqual(restored["last_response"]["data"]["finance_report"], quarterly)
+        gemini.assert_not_called()
+
+        with self.session_factory() as db:
+            for month_number in (5, 6, 8, 9):
+                db.add(Payment(bill_id=bill_id, amount=10, payment_method="Cash", payment_status="Completed",
+                               paid_at=datetime(2026, month_number, 2)))
+            db.add_all(Expense(description="Historical observation", category="Supplies", amount=5, payment_method="Cash",
+                               expense_date=date(2026, 10, day)) for day in range(1, 9))
+            db.commit()
+        forecast = report("Forecast next month's collections")
+        self.assertEqual(metrics(forecast)["Baseline forecast"], Decimal("30.87"))
+        self.assertEqual((forecast["start_date"], forecast["end_date"]), ("2026-12-01", "2026-12-31"))
+        candidates = report("Identify unusual expenses")
+        self.assertEqual(metrics(candidates)["Candidates"], 1)
+        self.assertIn("threshold ₹15.00 (n=8)", candidates["metrics"][1]["label"])
+        self.assertEqual(report("Show department expense breakdown")["charts"], [])
+
+        for role in ("patient", "doctor"):
+            result = ask("Show monthly collections for the last 12 months", headers[role])
+            self.assertNotIn("finance_report", result["data"])
+
+    def test_finance_chart_schema_and_approval_gated_payment(self):
+        from pydantic import ValidationError
+        from app.schemas.finance_analytics import FinanceChart
+
+        with self.assertRaises(ValidationError):
+            FinanceChart.model_validate({
+                "title": "Bad chart", "kind": "line", "labels": ["Nov"], "has_activity": True,
+                "series": [{"label": "Collections", "values": ["1", "2"]}],
+            })
+        headers, appointments, _, _ = self._cancellation_fixture()
+        with self.session_factory() as db:
+            patient_id = db.get(Appointment, appointments["own"]).patient_id
+            bill = Bill(patient_id=patient_id, bill_number="ANALYTICS-APPROVAL", total_amount=100, status="Pending")
+            db.add(bill)
+            db.commit()
+            bill_id = bill.id
+
+        class Call:
+            name = "record_payment"
+            args = {"bill_id": bill_id, "amount": 20, "payment_method": "Cash"}
+
+        class Response:
+            function_calls = [Call()]
+
+        with patch("app.ai.orchestrator._gemini_response", return_value=Response()):
+            response = self.client.post("/api/ai/chat", headers=headers["staff"], json={"query": "Record payment"})
+        self.assertEqual(response.status_code, 200, response.text)
+        self.assertEqual(response.json()["status"], "approval_required")
+        with self.session_factory() as db:
+            self.assertEqual(db.query(Payment).count(), 0)
+        approval = self.client.post(f"/api/ai/approvals/{response.json()['approval_id']}/approve", headers=headers["staff"])
+        self.assertEqual(approval.status_code, 200, approval.text)
+        with self.session_factory() as db:
+            self.assertEqual(db.query(Payment).one().amount, Decimal("20.00"))
 
     def test_gemini_mocked_function_call_executes_registered_tool(self):
         class Call:
@@ -1308,6 +1664,552 @@ class ApiIntegrationTests(unittest.TestCase):
             headers=second_headers,
         )
         self.assertEqual(unauthorized.status_code, 403)
+
+    def test_latest_conversations_are_restored_per_authenticated_role(self):
+        db = self.session_factory()
+        try:
+            users = [
+                User(full_name="Restore Patient", email="restore.patient@example.com", password_hash=security.hash_password("patient-password"), role="patient", is_active=True, approval_status="approved"),
+                User(full_name="Restore Clinician", email="restore.clinician@example.com", password_hash=security.hash_password("doctor-password"), role="clinician", is_active=True, approval_status="approved"),
+                User(full_name="Restore Staff", email="restore.staff@example.com", password_hash=security.hash_password("staff-password"), role="staff", is_active=True, approval_status="approved"),
+            ]
+            db.add_all(users)
+            db.flush()
+            db.add_all([
+                Patient(name="Restore Patient", age=30, email="restore.patient@example.com", user_id=users[0].id),
+                Doctor(name="Restore Clinician", specialization="Cardiology", email="restore.clinician.profile@example.com", user_id=users[1].id),
+            ])
+            db.commit()
+        finally:
+            db.close()
+
+        def auth(email, password, role):
+            result = self.client.post("/api/auth/login", json={"email": email, "password": password, "role": role})
+            self.assertEqual(result.status_code, 200)
+            return {"Authorization": f"Bearer {result.json()['access_token']}"}
+
+        patient_headers = auth("restore.patient@example.com", "patient-password", "patient")
+        clinician_headers = auth("restore.clinician@example.com", "doctor-password", "clinician")
+        staff_headers = auth("restore.staff@example.com", "staff-password", "staff")
+        no_tools = type("NoToolCalls", (), {"function_calls": [], "text": ""})()
+
+        with patch("app.ai.orchestrator._gemini_response", return_value=no_tools):
+            patient_chat = self.client.post("/api/ai/chat", headers=patient_headers, json={"query": "I need system support"})
+            clinician_chat = self.client.post("/api/ai/chat", headers=clinician_headers, json={"query": "Where is my dashboard?"})
+            staff_chat = self.client.post("/api/ai/chat", headers=staff_headers, json={"query": "Where is my dashboard?"})
+            admin_chat = self.client.post("/api/ai/chat", headers=self.headers, json={"query": "Where is my dashboard?"})
+        chats = (
+            (patient_headers, patient_chat),
+            (clinician_headers, clinician_chat),
+            (staff_headers, staff_chat),
+            (self.headers, admin_chat),
+        )
+        conversation_ids = set()
+        for headers, response in chats:
+            self.assertEqual(response.status_code, 200)
+            conversation_id = response.json()["conversation_id"]
+            conversation_ids.add(conversation_id)
+            restored = self.client.get("/api/ai/conversations/latest", headers=headers)
+            self.assertEqual(restored.status_code, 200)
+            self.assertEqual(restored.json()["conversation_id"], conversation_id)
+            self.assertEqual(restored.json()["messages"][-1]["content"], response.json()["message"])
+        self.assertEqual(len(conversation_ids), 4)
+
+        first_patient_conversation = patient_chat.json()["conversation_id"]
+        with patch("app.ai.orchestrator._gemini_response", return_value=no_tools):
+            second_patient_chat = self.client.post("/api/ai/chat", headers=patient_headers, json={"query": "Where is my dashboard?"})
+        self.assertEqual(second_patient_chat.status_code, 200)
+        self.assertNotEqual(second_patient_chat.json()["conversation_id"], first_patient_conversation)
+        latest_patient = self.client.get("/api/ai/conversations/latest", headers=patient_headers)
+        self.assertEqual(latest_patient.json()["conversation_id"], second_patient_chat.json()["conversation_id"])
+
+        cross_user = self.client.post("/api/ai/chat", headers=clinician_headers, json={
+            "query": "Continue this conversation",
+            "conversation_id": second_patient_chat.json()["conversation_id"],
+        })
+        self.assertEqual(cross_user.status_code, 403)
+
+    def test_conversation_deletion_removes_messages_and_all_associated_approvals(self):
+        no_tools = type("NoToolCalls", (), {"function_calls": [], "text": ""})()
+        with patch("app.ai.orchestrator._gemini_response", return_value=no_tools):
+            chat = self.client.post("/api/ai/chat", headers=self.headers, json={"query": "I need system support"})
+        self.assertEqual(chat.status_code, 200)
+        conversation_id = chat.json()["conversation_id"]
+
+        db = self.session_factory()
+        try:
+            admin = db.query(User).filter(User.email == "admin@example.com").first()
+            db.add_all([
+                AIApproval(id="delete-pending", conversation_id=conversation_id, user_id=admin.id, action="create_appointment", parameters_json={"doctor_id": 1}, status="pending", expires_at=datetime.now(timezone.utc) + timedelta(minutes=10)),
+                AIApproval(id="delete-executed", conversation_id=conversation_id, user_id=admin.id, action="record_payment", parameters_json={"bill_id": 1}, status="executed", expires_at=datetime.now(timezone.utc) + timedelta(minutes=10)),
+            ])
+            db.commit()
+        finally:
+            db.close()
+
+        deleted = self.client.delete(f"/api/ai/conversations/{conversation_id}", headers=self.headers)
+        self.assertEqual(deleted.status_code, 204)
+        latest = self.client.get("/api/ai/conversations/latest", headers=self.headers)
+        self.assertEqual(latest.status_code, 200)
+        self.assertIsNone(latest.json()["conversation_id"])
+        unavailable = self.client.post("/api/ai/chat", headers=self.headers, json={
+            "query": "Continue this conversation",
+            "conversation_id": conversation_id,
+        })
+        self.assertEqual(unavailable.status_code, 404)
+        db = self.session_factory()
+        try:
+            self.assertEqual(db.query(AIConversationMessage).filter(AIConversationMessage.conversation_id == conversation_id).count(), 0)
+            self.assertEqual(db.query(AIApproval).filter(AIApproval.conversation_id == conversation_id).count(), 0)
+        finally:
+            db.close()
+
+    def test_expired_conversation_confirmation_restores_without_approval_actions(self):
+        db = self.session_factory()
+        try:
+            user = db.query(User).filter(User.email == "admin@example.com").first()
+            conversation_id = "expired-restore-conversation"
+            db.add_all([
+                AIConversationMessage(user_id=user.id, conversation_id=conversation_id, role="user", content="Book with Dr Rao"),
+                AIConversationMessage(user_id=user.id, conversation_id=conversation_id, role="assistant", content="Review and confirm this appointment."),
+                AIApproval(id="expired-restore-approval", conversation_id=conversation_id, user_id=user.id, action="create_appointment", parameters_json={"doctor_id": 1}, status="pending", expires_at=datetime.now(timezone.utc) - timedelta(minutes=1)),
+            ])
+            db.commit()
+        finally:
+            db.close()
+
+        restored = self.client.get("/api/ai/conversations/latest", headers=self.headers)
+        self.assertEqual(restored.status_code, 200)
+        body = restored.json()
+        self.assertEqual(body["conversation_id"], "expired-restore-conversation")
+        self.assertIsNone(body["pending_approval"])
+        self.assertTrue(body["expired_approval"])
+        self.assertIn("expired", body["messages"][-1]["content"].lower())
+        db = self.session_factory()
+        try:
+            approval = db.query(AIApproval).filter(AIApproval.id == "expired-restore-approval").first()
+            self.assertEqual(approval.status, "expired")
+        finally:
+            db.close()
+
+    def _cancellation_fixture(self):
+        # Test databases recycle user IDs while the process-wide limiter retains its counters.
+        self.enterContext(patch("app.api.ai.enforce_rate_limit"))
+        with self.session_factory() as db:
+            users = {
+                name: User(full_name=name, email=f"{name}@cancel.example", password_hash="unused",
+                           role=role, is_active=True, approval_status="approved")
+                for name, role in (
+                    ("patient", "patient"), ("other_patient", "patient"),
+                    ("doctor", "clinician"), ("other_doctor", "clinician"), ("staff", "staff"),
+                )
+            }
+            db.add_all(users.values())
+            db.flush()
+            patient = Patient(name="Cancellation Patient", age=30, user_id=users["patient"].id)
+            other_patient = Patient(name="Other Patient", age=30, user_id=users["other_patient"].id)
+            doctor = Doctor(name="Review Doctor", specialization="Cardiology", email="review@cancel.example",
+                            user_id=users["doctor"].id)
+            other_doctor = Doctor(name="Other Doctor", specialization="Cardiology", email="other@cancel.example",
+                                  user_id=users["other_doctor"].id)
+            db.add_all([patient, other_patient, doctor, other_doctor])
+            db.flush()
+            start = (datetime.now() + timedelta(days=7)).replace(hour=9, minute=0, second=0, microsecond=0)
+            appointments = {
+                "own": Appointment(patient_id=patient.id, doctor_id=doctor.id, appointment_date=start, status="Scheduled"),
+                "foreign": Appointment(patient_id=other_patient.id, doctor_id=doctor.id,
+                                       appointment_date=start + timedelta(hours=1), status="Scheduled"),
+                "past": Appointment(patient_id=patient.id, doctor_id=doctor.id,
+                                    appointment_date=start - timedelta(days=8), status="Scheduled"),
+                "completed": Appointment(patient_id=patient.id, doctor_id=doctor.id,
+                                         appointment_date=start + timedelta(hours=2), status="Completed"),
+                "booking": Appointment(patient_id=patient.id, doctor_id=doctor.id,
+                                       appointment_date=start + timedelta(hours=3), status="Pending Doctor Approval"),
+            }
+            db.add_all(appointments.values())
+            db.add(DoctorAvailability(doctor_id=doctor.id, day_of_week=start.strftime("%A"),
+                                      start_time=start.time(), end_time=(start + timedelta(hours=4)).time(),
+                                      is_available=True))
+            db.commit()
+            headers = {name: {"Authorization": f"Bearer {security.create_access_token(user)}"} for name, user in users.items()}
+            return headers, {name: item.id for name, item in appointments.items()}, doctor.id, start
+
+    def _cancellation_chat(self, headers, query="Cancel my booking", conversation=None):
+        response = self.client.post("/api/ai/chat", headers=headers, json={"query": query, "conversation_id": conversation})
+        self.assertEqual(response.status_code, 200, response.text)
+        return response.json()
+
+    def _select_cancellation(self, headers, conversation, appointment):
+        return self.client.post(f"/api/ai/conversations/{conversation}/cancellation-selection",
+                                headers=headers, json={"appointment_id": appointment})
+
+    def _cancellation_slot(self, headers, doctor_id, start):
+        response = self.client.get(f"/api/availability/slots/{doctor_id}", headers=headers,
+                                   params={"date": start.date().isoformat()})
+        self.assertEqual(response.status_code, 200, response.text)
+        return next(slot["status"] for slot in response.json()["slots"] if slot["start"] == start.isoformat())
+
+    def test_doctor_dashboard_prompts_use_authenticated_routing_after_support_fallback(self):
+        headers, appointments, _, _ = self._cancellation_fixture()
+        conversation_id = "doctor-dashboard-routing-regression"
+        fallback = "Please describe whether you need hospital, billing, appointment, or technical support."
+        with self.session_factory() as db:
+            doctor_user_id = db.get(Appointment, appointments["own"]).doctor.user_id
+            db.add_all([
+                AIConversationMessage(user_id=doctor_user_id, conversation_id=conversation_id,
+                                      role="user", content="Give me my daily briefing"),
+                AIConversationMessage(user_id=doctor_user_id, conversation_id=conversation_id,
+                                      role="assistant", content=fallback),
+            ])
+            db.commit()
+
+        prompts = (
+            ("Give me my daily briefing", "doctor_daily_briefing"),
+            ("What appointments do I have this week?", "doctor_daily_briefing"),
+            ("Show my pending appointment requests", "doctor_daily_briefing"),
+            ("Show my pending cancellation requests", "doctor_daily_briefing"),
+            ("Compare this week with last week", "doctor_weekly_workload"),
+            ("Show my assigned patients", "doctor_patient_timeline"),
+        )
+        with patch("app.ai.orchestrator._gemini_response", side_effect=ConnectionError("offline")) as gemini:
+            for query, tool in prompts:
+                with self.subTest(query=query):
+                    response = self.client.post("/api/ai/chat", headers=headers["doctor"], json={
+                        "query": query, "conversation_id": conversation_id, "role": "patient",
+                    })
+                    self.assertEqual(response.status_code, 200, response.text)
+                    result = response.json()
+                    self.assertEqual(result["agent"], "Doctor AI Agent")
+                    self.assertEqual(result["status"], "completed")
+                    self.assertEqual([entry["tool"] for entry in result["trace"]], [tool])
+                    self.assertIn("doctor_intelligence", result["data"])
+            gemini.assert_not_called()
+            denied = self.client.post("/api/ai/chat", headers=headers["patient"], json={
+                "query": "Give me my daily briefing", "role": "clinician",
+            })
+            self.assertEqual(denied.status_code, 200, denied.text)
+            self.assertEqual(denied.json()["agent"], "Customer Support Agent")
+            self.assertEqual(denied.json()["message"], fallback)
+            self.assertNotIn("doctor_intelligence", denied.json()["data"])
+
+    def test_doctor_week_boundaries_counts_and_trace_on_november_2026_dates(self):
+        headers, appointments, doctor_id, _ = self._cancellation_fixture()
+        upcoming = [datetime(2026, 11, 30, hour, minute) for hour, minute in ((11, 0), (14, 30), (15, 30))]
+        with self.session_factory() as db:
+            patient_id = db.get(Appointment, appointments["own"]).patient_id
+            for index, appointment_id in enumerate(appointments.values()):
+                db.get(Appointment, appointment_id).appointment_date = datetime(2026, 10, 1, 9) + timedelta(hours=index)
+            db.add_all(Appointment(doctor_id=doctor_id, patient_id=patient_id, appointment_date=when, status="Scheduled")
+                       for when in upcoming)
+            db.commit()
+
+        def ask(prompt, tool):
+            response = self.client.post("/api/ai/chat", headers=headers["doctor"], json={"query": prompt})
+            self.assertEqual(response.status_code, 200, response.text)
+            result = response.json()
+            self.assertEqual(result["status"], "completed")
+            self.assertEqual([(item["tool"], item["status"]) for item in result["trace"]], [(tool, "success")])
+            return result["data"]["doctor_intelligence"]
+
+        def workload():
+            return ask("Compare this week with last week", "doctor_weekly_workload")["periods"]
+
+        def counts(periods):
+            return [tuple(period[key] for key in ("scheduled", "completed", "cancelled")) for period in periods]
+
+        with patch("app.services.doctor_intelligence.datetime", wraps=datetime) as clock:
+            clock.now.return_value = datetime(2026, 11, 25, 12)
+            daily = ask("Give me my daily briefing", "doctor_daily_briefing")
+            self.assertEqual(daily["date"], "2026-11-25")
+            future = next(section["visits"] for section in daily["sections"] if section["title"] == "Upcoming scheduled visits")
+            self.assertEqual([item["appointment_date"] for item in future], [when.isoformat() for when in upcoming])
+            weekly = ask("What appointments do I have this week?", "doctor_daily_briefing")
+            self.assertEqual(weekly["period"], {"start": "2026-11-23", "end": "2026-11-29"})
+            self.assertEqual(weekly["sections"][0]["visits"], [])
+            comparison = workload()
+            self.assertEqual([(period["start"], period["end"]) for period in comparison],
+                             [("2026-11-23", "2026-11-29"), ("2026-11-16", "2026-11-22")])
+            self.assertEqual(counts(comparison), [(0, 0, 0), (0, 0, 0)])
+
+            with self.session_factory() as db:
+                db.add_all([
+                    Appointment(doctor_id=doctor_id, patient_id=patient_id, appointment_date=datetime(2026, 11, 23),
+                                status="Scheduled", cancellation_status="Pending Doctor Approval"),
+                    Appointment(doctor_id=doctor_id, patient_id=patient_id, appointment_date=datetime(2026, 11, 23, 10),
+                                status="Pending Doctor Approval"),
+                    Appointment(doctor_id=doctor_id, patient_id=patient_id, appointment_date=datetime(2026, 11, 29, 23, 59),
+                                status="Completed"),
+                ])
+                db.commit()
+            self.assertEqual(counts(workload()), [(1, 1, 0), (0, 0, 0)])
+            with self.session_factory() as db:
+                db.add(Appointment(doctor_id=doctor_id, patient_id=patient_id, appointment_date=datetime(2026, 11, 16),
+                                   status="Cancelled", cancellation_status="Approved"))
+                db.commit()
+            self.assertEqual(counts(workload()), [(1, 1, 0), (0, 0, 1)])
+
+            clock.now.return_value = datetime(2026, 11, 30)
+            next_week = ask("What appointments do I have this week?", "doctor_daily_briefing")
+            self.assertEqual([item["appointment_date"] for item in next_week["sections"][0]["visits"]],
+                             [when.isoformat() for when in upcoming])
+            self.assertEqual(counts(workload()), [(3, 0, 0), (1, 1, 0)])
+
+    def test_doctor_intelligence_is_scoped_and_works_without_gemini(self):
+        from app.ai.orchestrator import DOCTOR_INTELLIGENCE_TOOLS, _gemini_declarations
+
+        headers, appointments, doctor_id, _ = self._cancellation_fixture()
+        clinician = headers["doctor"]
+        today = datetime.now().replace(hour=0, minute=0, second=0, microsecond=0)
+        week = today - timedelta(days=today.weekday())
+        with self.session_factory() as db:
+            existing = db.get(Appointment, appointments["own"])
+            patient_id = existing.patient_id
+            existing.cancellation_status = "Pending Doctor Approval"
+            existing.cancellation_requested_at = datetime.now(timezone.utc)
+            db.add_all([
+                Appointment(doctor_id=doctor_id, patient_id=patient_id, appointment_date=today + timedelta(hours=9), status="Scheduled"),
+                Appointment(doctor_id=doctor_id, patient_id=patient_id, appointment_date=today + timedelta(hours=10), status="Completed"),
+                Appointment(doctor_id=doctor_id, patient_id=patient_id, appointment_date=today + timedelta(hours=11), status="Completed"),
+                Appointment(doctor_id=doctor_id, patient_id=patient_id, appointment_date=week - timedelta(hours=4), status="Cancelled", reason="Recorded reason"),
+            ])
+            db.commit()
+
+        def ask(query, *, actor=clinician, expected=200, **options):
+            response = self.client.post("/api/ai/chat", headers=actor, json={"query": query, **options})
+            self.assertEqual(response.status_code, expected, response.text)
+            return response.json()
+
+        with patch("app.ai.orchestrator._gemini_response", side_effect=RuntimeError("offline")) as gemini:
+            for prompt in ("Give me my daily briefing", "Summarize my day"):
+                briefing = ask(prompt)
+                self.assertEqual(briefing["agent"], "Doctor AI Agent")
+                sections = {item["title"]: item["visits"] for item in briefing["data"]["doctor_intelligence"]["sections"]}
+                self.assertEqual(len(sections["Scheduled today"]), 1)
+                self.assertEqual(len(sections["Pending booking requests"]), 1)
+                self.assertEqual(len(sections["Pending cancellation requests"]), 1)
+                self.assertEqual(len(sections["Completed visits today"]), 2)
+                self.assertIn("Upcoming scheduled visits", sections)
+                self.assertNotIn("id", sections["Scheduled today"][0])
+            empty = ask("What is my schedule today?", actor=headers["other_doctor"])
+            self.assertEqual(empty["data"]["doctor_intelligence"]["sections"][0]["visits"], [])
+            for prompt, title in (
+                ("Show my pending appointment requests", "Pending booking requests"),
+                ("Show my pending cancellation requests", "Pending cancellation requests"),
+                ("What appointments do I have this week?", "Appointments this week"),
+            ):
+                self.assertEqual(ask(prompt)["data"]["doctor_intelligence"]["title"], title)
+            completed = ask("How many patients have I seen today?")["data"]["doctor_intelligence"]["metrics"]
+            self.assertEqual([metric["value"] for metric in completed], [2, 1])
+            for prompt in ("Analyze my workload this week", "Compare this week with last week",
+                           "Show my appointment trends", "How many appointments were cancelled?"):
+                periods = ask(prompt)["data"]["doctor_intelligence"]["periods"]
+                self.assertEqual((periods[0]["completed"], periods[1]["cancelled"]), (2, 1))
+            assigned = ask("Show my assigned patients")
+            self.assertIn(patient_id, {item["id"] for item in assigned["data"]["doctor_intelligence"]["patients"]})
+            timeline = ask("Show this patient's appointment history", doctor_patient_id=patient_id,
+                           conversation_id=assigned["conversation_id"])
+            history = timeline["data"]["doctor_intelligence"]["sections"][0]["visits"]
+            self.assertTrue(any(item["reason"] == "Recorded reason" and item["appointment_date"] for item in history))
+            self.assertTrue(all(item["patient_name"] == "Cancellation Patient" for item in history))
+            follow_up = ask("Summarize my previous visits with this patient", conversation_id=assigned["conversation_id"])
+            self.assertEqual(follow_up["data"]["doctor_intelligence"], timeline["data"]["doctor_intelligence"])
+            restored = self.client.get("/api/ai/conversations/latest", headers=clinician).json()
+            self.assertEqual(restored["last_response"]["data"]["doctor_intelligence"], timeline["data"]["doctor_intelligence"])
+            denied = ask("Show this patient's appointment history", actor=headers["other_doctor"], doctor_patient_id=patient_id)
+            self.assertEqual(denied["status"], "error")
+            self.assertEqual(denied["data"], {})
+            ask("Show this patient's appointment history", actor=headers["patient"], doctor_patient_id=patient_id, expected=403)
+            gemini.assert_not_called()
+
+        self.assertTrue(DOCTOR_INTELLIGENCE_TOOLS <= {item.name for item in _gemini_declarations("clinician")})
+        for role in ("patient", "staff", "admin"):
+            self.assertFalse(DOCTOR_INTELLIGENCE_TOOLS & {item.name for item in _gemini_declarations(role)})
+
+        class DoctorCall:
+            name = "doctor_daily_briefing"
+            args = {}
+
+        class ModelResponse:
+            function_calls = [DoctorCall()]
+
+        with patch("app.ai.orchestrator._gemini_response", return_value=ModelResponse()):
+            denied = ask("Please run the tool", actor=headers["patient"])
+        self.assertEqual(denied["status"], "error")
+        self.assertIn("permission", denied["message"])
+        self.assertEqual(denied["data"], {})
+
+    def test_cancellation_routing_filters_owned_cards_and_restores_the_picker(self):
+        headers, appointments, _, start = self._cancellation_fixture()
+        patient = headers["patient"]
+        with self.session_factory() as db:
+            original = db.get(Appointment, appointments["own"])
+            original.doctor.name = "Hritik Sharma"
+            other_doctor = db.query(Doctor).filter(Doctor.name == "Other Doctor").one()
+            same_doctor = Appointment(patient_id=original.patient_id, doctor_id=original.doctor_id,
+                                      appointment_date=start + timedelta(days=1), status="Scheduled")
+            other_visit = Appointment(patient_id=original.patient_id, doctor_id=other_doctor.id,
+                                      appointment_date=start + timedelta(days=2), status="Scheduled")
+            db.add_all([same_doctor, other_visit])
+            db.commit()
+            same_doctor_id, other_visit_id = same_doctor.id, other_visit.id
+            db.add_all([
+                AIConversationMessage(user_id=original.patient.user_id, conversation_id="old-cancellation",
+                                      role="user", content="Cancel my appointment"),
+                AIConversationMessage(user_id=original.patient.user_id, conversation_id="old-cancellation",
+                                      role="assistant", content="I could not find that doctor. Please provide the doctor name or specialization."),
+            ])
+            db.commit()
+
+        with (
+            patch("app.ai.orchestrator._gemini_response") as model,
+            patch("app.ai.orchestrator._patient_appointment_conversation") as booking,
+            patch("app.ai.orchestrator._resolve_doctor") as directory,
+            patch("app.ai.orchestrator.REGISTRY.execute") as tools,
+        ):
+            for query in ("Cancel my appointment", "I need to cancel an appointment", "Cancel my appointment with Dr.Hritik"):
+                chat = self._cancellation_chat(patient, query)
+                self.assertEqual(chat["agent"], "Hospital Operations Agent")
+                self.assertEqual([card["id"] for card in chat["data"]["cancellation_options"]],
+                                 [appointments["own"], same_doctor_id, other_visit_id])
+                self.assertIsNone(chat["approval_id"])
+
+            conversation = chat["conversation_id"]
+            for current_conversation in ("old-cancellation", conversation):
+                filtered = self._cancellation_chat(patient, "Dr.Hritik", current_conversation)
+                self.assertEqual(filtered["agent"], "Hospital Operations Agent")
+                self.assertIn("correct date and time", filtered["message"])
+                self.assertEqual([card["id"] for card in filtered["data"]["cancellation_options"]],
+                                 [appointments["own"], same_doctor_id])
+                self.assertIsNone(filtered["approval_id"])
+            restored = self.client.get("/api/ai/conversations/latest", headers=patient).json()
+            self.assertEqual(restored["last_response"]["data"], filtered["data"])
+
+            unmatched = self._cancellation_chat(patient, "Dr.Nobody", conversation)
+            self.assertIn("No eligible appointment matches", unmatched["message"])
+            self.assertEqual(len(unmatched["data"]["cancellation_options"]), 3)
+            single = self._cancellation_chat(patient, "Dr.Other", conversation)
+            self.assertEqual([card["id"] for card in single["data"]["cancellation_options"]], [other_visit_id])
+            self.assertIsNone(single["approval_id"])
+
+            selected = self._select_cancellation(patient, conversation, other_visit_id)
+            self.assertEqual(selected.status_code, 200, selected.text)
+            proposal = selected.json()
+            self.assertEqual(proposal["status"], "approval_required")
+            follow_up = self._cancellation_chat(patient, "Dr.Other", conversation)
+            self.assertEqual(follow_up["approval_id"], proposal["approval_id"])
+            restored = self.client.get("/api/ai/conversations/latest", headers=patient).json()
+            self.assertEqual(restored["last_response"]["data"], proposal["data"])
+            self.assertEqual(restored["pending_approval"]["id"], proposal["approval_id"])
+            dashboard = self.client.get("/api/dashboard/doctor", headers=headers["other_doctor"]).json()
+            self.assertEqual(dashboard["cancellation_requests"], [])
+
+        for mock in (model, booking, directory, tools):
+            mock.assert_not_called()
+
+    def test_patient_cancellation_eligibility_explicit_confirmation_and_doctor_approval(self):
+        headers, appointments, doctor_id, start = self._cancellation_fixture()
+        patient = headers["patient"]
+        for query in ("I want to cancel my appointment", "Cancel my booking", "I don't want to attend my appointment"):
+            chat = self._cancellation_chat(patient, query)
+            self.assertEqual([card["id"] for card in chat["data"]["cancellation_options"]], [appointments["own"]])
+            self.assertIsNone(chat["approval_id"])
+        conversation = chat["conversation_id"]
+        restored = self.client.get("/api/ai/conversations/latest", headers=patient).json()
+        self.assertEqual(restored["last_response"]["data"], chat["data"])
+        self.assertEqual(self._select_cancellation(headers["other_patient"], conversation, appointments["own"]).status_code, 404)
+        for ineligible in ("foreign", "past", "completed", "booking"):
+            self.assertEqual(self._select_cancellation(patient, conversation, appointments[ineligible]).status_code, 404)
+
+        path = f"/api/appointments/{appointments['own']}"
+        self.assertEqual(self.client.delete(path, headers=patient).status_code, 403)
+        for ineligible in ("past", "completed"):
+            self.assertEqual(self.client.delete(f"/api/appointments/{appointments[ineligible]}", headers=self.headers).status_code, 409)
+        selected = self._select_cancellation(patient, conversation, appointments["own"])
+        self.assertEqual(selected.status_code, 200, selected.text)
+        proposal = selected.json()
+        self.assertEqual(proposal["status"], "approval_required")
+        self.assertEqual(proposal["data"]["cancellation_selection"], chat["data"]["cancellation_options"][0])
+        restored = self.client.get("/api/ai/conversations/latest", headers=patient).json()
+        self.assertEqual(restored["last_response"]["data"], proposal["data"])
+        self.assertEqual(restored["pending_approval"]["id"], proposal["approval_id"])
+        self._cancellation_chat(patient, "confirm", conversation)
+        before = self.client.get("/api/dashboard/doctor", headers=headers["doctor"]).json()
+        self.assertEqual(before["cancellation_requests"], [])
+        self.assertEqual([request["id"] for request in before["pending_requests"]], [appointments["booking"]])
+
+        approval_path = f"/api/ai/approvals/{proposal['approval_id']}/approve"
+        self.assertEqual(self.client.post(approval_path, headers=headers["other_patient"]).status_code, 403)
+        confirmed = self.client.post(approval_path, headers=patient)
+        self.assertEqual(confirmed.status_code, 200, confirmed.text)
+        self.assertEqual(confirmed.json()["result"]["status"], "Pending Doctor Approval")
+        self.assertEqual(self.client.post(approval_path, headers=patient).status_code, 409)
+        self.assertEqual(self._cancellation_slot(patient, doctor_id, start), "booked")
+        no_options = self._cancellation_chat(patient)
+        self.assertEqual(no_options["data"]["cancellation_options"], [])
+        self.assertIn("no upcoming appointments eligible", no_options["message"])
+        pending_history = self.client.get("/api/dashboard/patient", headers=patient).json()["cancellation_history"]
+        self.assertEqual(pending_history[0]["cancellation_status"], "Pending Doctor Approval")
+        after = self.client.get("/api/dashboard/doctor", headers=headers["doctor"]).json()
+        self.assertEqual(len(after["cancellation_requests"]), 1)
+        request = after["cancellation_requests"][0]
+        self.assertEqual(request["patient_name"], "Cancellation Patient")
+        self.assertEqual(request["status"], "Pending Doctor Approval")
+        self.assertEqual(request["appointment_date"], start.isoformat())
+        self.assertTrue(request["requested_at"])
+        self.assertEqual(self.client.get("/api/dashboard/doctor", headers=headers["other_doctor"]).json()["cancellation_requests"], [])
+        decision = {"request_id": request["request_id"]}
+        for role in ("patient", "staff", "other_doctor"):
+            self.assertEqual(self.client.post(f"{path}/cancellation/approve", headers=headers[role], json=decision).status_code, 403)
+        self.assertEqual(self.client.delete(path, headers=headers["doctor"]).status_code, 409)
+        self.assertEqual(self.client.delete(f"/api/ai/conversations/{conversation}", headers=patient).status_code, 204)
+        approved = self.client.post(f"{path}/cancellation/approve", headers=headers["doctor"], json=decision)
+        self.assertEqual(approved.status_code, 200, approved.text)
+        self.assertEqual(self._cancellation_slot(patient, doctor_id, start), "available")
+        history = self.client.get("/api/dashboard/patient", headers=patient).json()["cancellation_history"]
+        self.assertEqual((history[0]["cancellation_status"], history[0]["status"]), ("Approved", "Cancelled"))
+        self.assertEqual(self.client.get("/api/dashboard/patient", headers=headers["other_patient"]).json()["cancellation_history"], [])
+        self.assertEqual(self._cancellation_chat(patient)["data"]["cancellation_options"], [])
+
+    def test_cancellation_rejection_retains_slot_and_stale_decisions_cannot_process_a_new_request(self):
+        headers, appointments, doctor_id, start = self._cancellation_fixture()
+        patient = headers["patient"]
+        appointment_id = appointments["own"]
+        path = f"/api/appointments/{appointment_id}/cancellation"
+
+        def propose():
+            conversation = self._cancellation_chat(patient)["conversation_id"]
+            response = self._select_cancellation(patient, conversation, appointment_id)
+            self.assertEqual(response.status_code, 200, response.text)
+            return response.json()["approval_id"]
+
+        def confirm(approval_id):
+            return self.client.post(f"/api/ai/approvals/{approval_id}/approve", headers=patient)
+
+        first, duplicate = propose(), propose()
+        self.assertEqual(confirm(first).status_code, 200)
+        self.assertEqual(confirm(duplicate).status_code, 409)
+        rejected = self.client.post(f"{path}/reject", headers=headers["doctor"],
+                                    json={"request_id": first, "reason": "  Please keep this follow-up.  "})
+        self.assertEqual(rejected.status_code, 200, rejected.text)
+        self.assertEqual(self._cancellation_slot(patient, doctor_id, start), "booked")
+        history = self.client.get("/api/dashboard/patient", headers=patient).json()["cancellation_history"][0]
+        self.assertEqual(history["status"], "Scheduled")
+        self.assertEqual(history["cancellation_status"], "Rejected")
+        self.assertEqual(history["cancellation_reason"], "Please keep this follow-up.")
+        self.assertEqual(confirm(duplicate).status_code, 409)
+
+        second = propose()
+        self.assertEqual(confirm(second).status_code, 200)
+        self.assertEqual(self.client.post(f"{path}/approve", headers=headers["doctor"], json={"request_id": first}).status_code, 409)
+        with ThreadPoolExecutor(max_workers=2) as executor:
+            decisions = [
+                executor.submit(self.client.post, f"{path}/{action}", headers=actor, json={"request_id": second})
+                for action, actor in (("approve", self.headers), ("reject", headers["doctor"]))
+            ]
+            responses = [decision.result() for decision in decisions]
+        self.assertEqual(sorted(response.status_code for response in responses), [200, 409])
+        expected_slot = "available" if responses[0].status_code == 200 else "booked"
+        self.assertEqual(self._cancellation_slot(patient, doctor_id, start), expected_slot)
 
     def test_ai_cancel_requires_approval_and_executes_after_approval(self):
         patient = self.client.post(
@@ -1588,6 +2490,105 @@ class ApiIntegrationTests(unittest.TestCase):
         self.assertEqual(self.client.get("/api/appointments/", headers=unlinked_headers).status_code, 403)
         self.assertEqual(self.client.get("/api/dashboard/metrics", headers=unlinked_headers).status_code, 403)
 
+    def test_patient_records_are_scoped_to_clinician_appointments(self):
+        db = self.session_factory()
+        try:
+            clinician_user = User(full_name="Assigned Clinician", email="assigned.clinician@example.com", password_hash=security.hash_password("doctor-password"), role="clinician", is_active=True, approval_status="approved")
+            staff_user = User(full_name="Patient Staff", email="patient.staff@example.com", password_hash=security.hash_password("staff-password"), role="staff", is_active=True, approval_status="approved")
+            db.add_all([clinician_user, staff_user])
+            db.flush()
+            doctor = Doctor(name="Assigned Clinician", specialization="Cardiology", email="assigned.clinician.profile@example.com", user_id=clinician_user.id)
+            assigned = Patient(name="Assigned Patient", age=36, email="assigned.record@example.com")
+            unrelated = Patient(name="Unrelated Patient", age=42, email="unrelated.record@example.com")
+            db.add_all([doctor, assigned, unrelated])
+            db.flush()
+            db.add(Appointment(patient_id=assigned.id, doctor_id=doctor.id, appointment_date=datetime.now() + timedelta(days=20), status="Scheduled"))
+            db.commit()
+            assigned_id, unrelated_id = assigned.id, unrelated.id
+        finally:
+            db.close()
+
+        def login(email, password, role):
+            response = self.client.post("/api/auth/login", json={"email": email, "password": password, "role": role})
+            self.assertEqual(response.status_code, 200)
+            return {"Authorization": f"Bearer {response.json()['access_token']}"}
+
+        clinician_headers = login("assigned.clinician@example.com", "doctor-password", "clinician")
+        staff_headers = login("patient.staff@example.com", "staff-password", "staff")
+
+        listing = self.client.get("/api/patients/", headers=clinician_headers, params={"search": "Patient", "sort": "name", "order": "asc", "offset": 0, "limit": 1})
+        self.assertEqual(listing.status_code, 200)
+        self.assertEqual([item["id"] for item in listing.json()], [assigned_id])
+        unrelated_search = self.client.get("/api/patients/", headers=clinician_headers, params={"search": "Unrelated", "sort": "name", "order": "desc", "limit": 1})
+        self.assertEqual(unrelated_search.status_code, 200)
+        self.assertEqual(unrelated_search.json(), [])
+        paginated = self.client.get("/api/patients/", headers=clinician_headers, params={"sort": "name", "order": "desc", "offset": 1, "limit": 1})
+        self.assertEqual(paginated.status_code, 200)
+        self.assertEqual(paginated.json(), [])
+        self.assertEqual(self.client.get(f"/api/patients/{assigned_id}", headers=clinician_headers).status_code, 200)
+        self.assertEqual(self.client.get(f"/api/patients/{unrelated_id}", headers=clinician_headers).status_code, 404)
+
+        update_payload = {"name": "Changed Name", "age": 42, "email": "unrelated.record@example.com"}
+        unrelated_update = self.client.put(f"/api/patients/{unrelated_id}", headers=clinician_headers, json=update_payload)
+        self.assertEqual(unrelated_update.status_code, 404)
+        self.assertEqual(self.client.delete(f"/api/patients/{unrelated_id}", headers=clinician_headers).status_code, 403)
+        assigned_update = self.client.put(f"/api/patients/{assigned_id}", headers=clinician_headers, json={"name": "Assigned Patient Updated", "age": 36, "email": "assigned.record@example.com"})
+        self.assertEqual(assigned_update.status_code, 200)
+
+        for headers in (self.headers, staff_headers):
+            all_patients = self.client.get("/api/patients/", headers=headers, params={"limit": 10})
+            self.assertEqual({item["id"] for item in all_patients.json()}, {assigned_id, unrelated_id})
+            self.assertEqual(self.client.get(f"/api/patients/{unrelated_id}", headers=headers).status_code, 200)
+            update = self.client.put(f"/api/patients/{unrelated_id}", headers=headers, json=update_payload)
+            self.assertEqual(update.status_code, 200)
+
+    def test_alternative_appointment_dates_have_real_free_slots(self):
+        db = self.session_factory()
+        try:
+            doctor_user = User(full_name="Availability Clinician", email="availability.clinician@example.com", password_hash=security.hash_password("doctor-password"), role="clinician", is_active=True, approval_status="approved")
+            patient_users = [
+                User(full_name=f"Availability Patient {index}", email=f"availability.patient{index}@example.com", password_hash=security.hash_password("patient-password"), role="patient", is_active=True, approval_status="approved")
+                for index in range(1, 4)
+            ]
+            db.add_all([doctor_user, *patient_users])
+            db.flush()
+            doctor = Doctor(name="Availability Clinician", specialization="Cardiology", email="availability.profile@example.com", user_id=doctor_user.id, appointment_duration_minutes=30)
+            patients = [Patient(name=f"Availability Patient {index}", age=30, email=f"availability.patient{index}@example.com", user_id=user.id) for index, user in enumerate(patient_users, start=1)]
+            db.add_all([doctor, *patients])
+            db.flush()
+            base_date = (datetime.now() + timedelta(days=21)).date()
+            full_date, partial_date = base_date + timedelta(days=1), base_date + timedelta(days=2)
+            for candidate in (full_date, partial_date):
+                db.add(DoctorAvailability(doctor_id=doctor.id, day_of_week=candidate.strftime("%A"), specific_date=candidate, start_time=datetime.strptime("09:00", "%H:%M").time(), end_time=datetime.strptime("10:00", "%H:%M").time(), is_available=True))
+            db.flush()
+            db.add_all([
+                Appointment(patient_id=patients[0].id, doctor_id=doctor.id, appointment_date=datetime.combine(full_date, datetime.strptime("09:00", "%H:%M").time()), status="Pending Doctor Approval"),
+                Appointment(patient_id=patients[1].id, doctor_id=doctor.id, appointment_date=datetime.combine(full_date, datetime.strptime("09:30", "%H:%M").time()), status="Scheduled"),
+                Appointment(patient_id=patients[2].id, doctor_id=doctor.id, appointment_date=datetime.combine(partial_date, datetime.strptime("09:00", "%H:%M").time()), status="Pending Doctor Approval"),
+            ])
+            db.commit()
+            doctor_id = doctor.id
+        finally:
+            db.close()
+
+        login = self.client.post("/api/auth/login", json={"email": "availability.patient1@example.com", "password": "patient-password", "role": "patient"})
+        headers = {"Authorization": f"Bearer {login.json()['access_token']}"}
+        result = self.client.get(f"/api/availability/slots/{doctor_id}", headers=headers, params={"date": base_date.isoformat()})
+        self.assertEqual(result.status_code, 200)
+        alternatives = result.json()["alternatives"]
+        self.assertNotIn(full_date.isoformat(), alternatives)
+        self.assertIn(partial_date.isoformat(), alternatives)
+        self.assertTrue(all(result.json()["slots"][i]["status"] != "available" for i in range(len(result.json()["slots"]))))
+
+        # A suggestion must still contain an unoccupied interval after checking
+        # the same pending/scheduled appointment rules used for the requested date.
+        for alternative in alternatives:
+            slots = self.client.get(f"/api/availability/slots/{doctor_id}", headers=headers, params={"date": alternative}).json()["slots"]
+            self.assertTrue(any(slot["status"] == "available" for slot in slots), alternative)
+
+        partial = self.client.get(f"/api/availability/slots/{doctor_id}", headers=headers, params={"date": partial_date.isoformat()}).json()
+        self.assertEqual([slot["status"] for slot in partial["slots"]], ["booked", "available"])
+
     def test_doctor_request_approval_scope_status_and_decline_releases_slot(self):
         target = (datetime.now() + timedelta(days=10)).replace(hour=0, minute=0, second=0, microsecond=0)
         db = self.session_factory()
@@ -1862,7 +2863,7 @@ class ApiIntegrationTests(unittest.TestCase):
             f"/api/bills/{bill['id']}",
             headers=patient_headers,
         )
-        self.assertEqual(foreign_bill.status_code, 403)
+        self.assertEqual(foreign_bill.status_code, 404)
 
         class Call:
             name = "get_patient"

@@ -63,6 +63,11 @@ class Appointment(Base):
 
     decline_reason = Column(String, nullable=True)
 
+    cancellation_request_id = Column(String(64), nullable=True)
+    cancellation_status = Column(String(32), nullable=True)
+    cancellation_requested_at = Column(DateTime(timezone=True), nullable=True)
+    cancellation_reason = Column(String(500), nullable=True)
+
     created_at = Column(
         DateTime(timezone=True),
         server_default=func.now()

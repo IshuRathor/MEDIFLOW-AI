@@ -1,3 +1,5 @@
+import type { FinanceReportData } from './FinanceReport.js'
+
 const API_BASE_URL = import.meta.env.VITE_API_URL ?? 'http://localhost:8000/api'
 
 export type UserRecord = {
@@ -303,6 +305,10 @@ export function getMyAvailability(token: string): Promise<AvailabilityRecord[]> 
   return get<AvailabilityRecord[]>('/availability/me', token)
 }
 
+export function getDoctorAvailability(token: string, doctorId: number): Promise<AvailabilityRecord[]> {
+  return get<AvailabilityRecord[]>(`/availability/doctor/${doctorId}`, token)
+}
+
 export function createAvailability(
   token: string,
   input: { day_of_week: string; start_time: string; end_time: string; specific_date?: string; is_available: boolean },
@@ -358,6 +364,32 @@ export function deleteDoctor(token: string, doctorId: number): Promise<void> {
 
 export function cancelAppointment(token: string, appointmentId: number): Promise<void> {
   return remove(`/appointments/${appointmentId}`, token)
+}
+
+export type DoctorCancellationRequest = {
+  id: number
+  request_id: string
+  patient_name: string
+  appointment_date: string
+  requested_at: string
+  status: 'Pending Doctor Approval'
+  can_approve: boolean
+}
+
+export type PatientCancellationUpdate = {
+  doctor_name: string
+  appointment_date: string
+  status: string
+  cancellation_status: 'Pending Doctor Approval' | 'Approved' | 'Rejected'
+  cancellation_reason: string | null
+}
+
+export function decideCancellation(token: string, request: DoctorCancellationRequest, decision: 'approve' | 'reject', reason?: string) {
+  return post<{ status: 'Approved' | 'Rejected' }>(
+    `/appointments/${request.id}/cancellation/${decision}`,
+    { request_id: request.request_id, reason },
+    token,
+  )
 }
 
 export function getBills(token: string): Promise<BillRecord[]> {
@@ -425,20 +457,60 @@ export type ChatResponse = {
   agent: string
   status: 'completed' | 'clarification_required' | 'approval_required' | 'error'
   message: string
-  data: Record<string, unknown>
+  data: Record<string, unknown> & { finance_report?: FinanceReportData }
   trace: Array<{ tool: string; status: 'success' | 'error' | 'skipped' | 'approval_required'; duration_ms: number }>
   approval_id: string | null
   [key: string]: unknown
 }
 
-export async function chatWithMediflow(query: string, token: string, conversationId?: string): Promise<ChatResponse> {
+export type ConversationMessage = {
+  role: 'user' | 'assistant'
+  content: string
+}
+
+export type LatestConversation = {
+  conversation_id: string | null
+  messages: ConversationMessage[]
+  last_response: {
+    status: ChatResponse['status']
+    agent: string
+    data: ChatResponse['data']
+    trace?: ChatResponse['trace']
+  } | null
+  pending_approval: { id: string; action: string; expires_at: string } | null
+  expired_approval: boolean
+}
+
+export async function getLatestAIConversation(token: string): Promise<LatestConversation> {
+  const response = await fetch(`${API_BASE_URL}/ai/conversations/latest`, {
+    headers: { Authorization: `Bearer ${token}` },
+  })
+  if (!response.ok) {
+    const body = await response.json().catch(() => null) as { detail?: string } | null
+    throw new Error(body?.detail ?? 'The saved conversation could not be restored.')
+  }
+  return response.json() as Promise<LatestConversation>
+}
+
+export async function deleteAIConversation(token: string, conversationId: string): Promise<void> {
+  const response = await fetch(`${API_BASE_URL}/ai/conversations/${encodeURIComponent(conversationId)}`, {
+    method: 'DELETE',
+    headers: { Authorization: `Bearer ${token}` },
+  })
+  if (!response.ok) {
+    const body = await response.json().catch(() => null) as { detail?: string } | null
+    throw new Error(body?.detail ?? 'The conversation could not be deleted.')
+  }
+}
+
+export async function chatWithMediflow(query: string, token: string, conversationId?: string, doctorPatientId?: number): Promise<ChatResponse> {
   const response = await fetch(`${API_BASE_URL}/ai/chat`, {
     method: 'POST',
     headers: {
       Authorization: `Bearer ${token}`,
       'Content-Type': 'application/json',
     },
-    body: JSON.stringify({ query, conversation_id: conversationId ?? null }),
+    body: JSON.stringify({ query, conversation_id: conversationId ?? null, doctor_patient_id: doctorPatientId }),
   })
   if (!response.ok) {
     const body = await response.json().catch(() => null) as { detail?: string } | null
@@ -453,6 +525,14 @@ export type ApprovalResponse = {
   action: string
   parameters: Record<string, unknown>
   result: Record<string, unknown> | null
+}
+
+export function selectCancellationAppointment(token: string, conversationId: string, appointmentId: number) {
+  return post<ChatResponse>(
+    `/ai/conversations/${encodeURIComponent(conversationId)}/cancellation-selection`,
+    { appointment_id: appointmentId },
+    token,
+  )
 }
 
 export async function decideAIApproval(

@@ -51,3 +51,16 @@ htmlcov/
 *.db
 *.sqlite
 *.sqlite3
+*.db-journal
+*.db-wal
+*.db-shm
+*.sqlite*-journal
+*.sqlite*-wal
+*.sqlite*-shm
+*.dump
+*.pgdump
+*.backup
+*.sql.gz
+backups/
+.ruff_cache/
+.venv-*/

@@ -60,14 +60,11 @@ def _rules_for_date(db: Session, doctor_id: int, target_date: date):
     return recurring, False
 
 
-def generate_slots(db: Session, doctor_id: int, target_date: date):
-    doctor = db.query(Doctor).filter(Doctor.id == doctor_id).first()
-    if not doctor:
-        raise HTTPException(status_code=404, detail="Doctor not found")
-
+def _slots_for_date(db: Session, doctor: Doctor, target_date: date):
+    doctor_id = doctor.id
     rules, blocked = _rules_for_date(db, doctor_id, target_date)
     if blocked:
-        return {"blocked": True, "slots": [], "alternatives": _next_available_dates(db, doctor_id, target_date)}
+        return [], True
 
     duration = max(doctor.appointment_duration_minutes or 30, 5)
     appointments = db.query(Appointment).filter(
@@ -95,17 +92,27 @@ def generate_slots(db: Session, doctor_id: int, target_date: date):
             })
             cursor = slot_end
 
-    if not slots:
-        return {"blocked": False, "slots": [], "alternatives": _next_available_dates(db, doctor_id, target_date)}
-    return {"blocked": False, "slots": slots, "alternatives": []}
+    return slots, False
 
 
-def _next_available_dates(db: Session, doctor_id: int, target_date: date, limit: int = 7):
+def generate_slots(db: Session, doctor_id: int, target_date: date):
+    doctor = db.query(Doctor).filter(Doctor.id == doctor_id).first()
+    if not doctor:
+        raise HTTPException(status_code=404, detail="Doctor not found")
+
+    slots, blocked = _slots_for_date(db, doctor, target_date)
+    alternatives = _next_available_dates(db, doctor, target_date) if blocked or not slots or all(
+        slot["status"] == "booked" for slot in slots
+    ) else []
+    return {"blocked": blocked, "slots": slots, "alternatives": alternatives}
+
+
+def _next_available_dates(db: Session, doctor: Doctor, target_date: date, limit: int = 7):
     alternatives = []
     for offset in range(1, 15):
         candidate = target_date + timedelta(days=offset)
-        rules, blocked = _rules_for_date(db, doctor_id, candidate)
-        if rules and not blocked:
+        slots, blocked = _slots_for_date(db, doctor, candidate)
+        if not blocked and any(slot["status"] == "available" for slot in slots):
             alternatives.append(candidate.isoformat())
             if len(alternatives) >= limit:
                 break

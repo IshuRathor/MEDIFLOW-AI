@@ -7,6 +7,8 @@ from app.models.patient import Patient
 from app.schemas.patient import PatientCreate, PatientResponse
 from app.core.security import get_current_user
 from app.models.user import User
+from app.models.appointment import Appointment
+from app.models.doctor import Doctor
 from sqlalchemy.exc import IntegrityError
 
 
@@ -23,6 +25,20 @@ def get_db():
         yield db
     finally:
         db.close()
+
+
+def _apply_patient_access_scope(query, db: Session, current_user: User):
+    """Restrict patient queries before search, ordering, pagination, or lookup."""
+    if current_user.role == "patient":
+        return query.filter(Patient.user_id == current_user.id)
+    if current_user.role == "clinician":
+        assigned_patient_ids = (
+            db.query(Appointment.patient_id)
+            .join(Doctor, Doctor.id == Appointment.doctor_id)
+            .filter(Doctor.user_id == current_user.id)
+        )
+        return query.filter(Patient.id.in_(assigned_patient_ids))
+    return query
 
 
 # CREATE PATIENT
@@ -67,13 +83,7 @@ def get_patients(
 ):
     allowed_sort_fields = {"name": Patient.name, "created_at": Patient.created_at, "age": Patient.age}
     sort_column = allowed_sort_fields.get(sort, Patient.created_at)
-    query = db.query(Patient)
-    if current_user.role == "patient":
-        owned_patient = db.query(Patient).filter(Patient.user_id == current_user.id).first()
-        if not owned_patient:
-            query = query.filter(Patient.id == -1)
-        else:
-            query = query.filter(Patient.id == owned_patient.id)
+    query = _apply_patient_access_scope(db.query(Patient), db, current_user)
     if search:
         query = query.filter(
             Patient.name.ilike(f"%{search}%") | Patient.email.ilike(f"%{search}%")
@@ -89,18 +99,19 @@ def get_patient(
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
-    patient = db.query(Patient).filter(
-        Patient.id == patient_id
-    ).first()
+    patient_query = db.query(Patient).filter(Patient.id == patient_id)
+    if current_user.role == "patient":
+        patient = patient_query.first()
+        if patient and patient.user_id != current_user.id:
+            raise HTTPException(status_code=403, detail="You can only access your own patient record")
+    else:
+        patient = _apply_patient_access_scope(patient_query, db, current_user).first()
 
     if not patient:
         raise HTTPException(
             status_code=404,
             detail="Patient not found"
         )
-    if current_user.role == "patient" and patient.user_id != current_user.id:
-        raise HTTPException(status_code=403, detail="You can only access your own patient record")
-
     return patient
 
 
@@ -113,11 +124,12 @@ def get_patient(
 def update_patient(
     patient_id: int,
     patient_data: PatientCreate,
-    db: Session = Depends(get_db)
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
 ):
-    patient = db.query(Patient).filter(
-        Patient.id == patient_id
-    ).first()
+    patient = _apply_patient_access_scope(
+        db.query(Patient), db, current_user
+    ).filter(Patient.id == patient_id).first()
 
     if not patient:
         raise HTTPException(
